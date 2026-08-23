@@ -3,12 +3,11 @@
   "displayName": "ISeeC: A C Execution Visualizer",
   "description": "Step-by-step C execution visualizer powered by GDB — shows call stack, locals, and heap at every step.",
   "version": "0.1.0",
-  "publisher": "your-publisher-id",
+  "publisher": "DustyAdri",
   "license": "MIT",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Debuggers", "Education", "Visualization"],
   "keywords": ["C", "GDB", "debugger", "visualizer", "PythonTutor"],
-  "icon": "media/icon.png", 
   "repository": { "type": "git", "url": "https://github.com/DustyAdri/ISeeC" },
 
   "activationEvents": [],

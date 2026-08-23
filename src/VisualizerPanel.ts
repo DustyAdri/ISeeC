@@ -11,13 +11,12 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
-import * as os from 'os';
 import * as crypto from 'crypto';
 
-import { exec, ExecException } from "child_process";
+import { execFile, spawn, ExecException } from "child_process";
 import { promisify } from "util";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -69,6 +68,7 @@ export class VisualizerPanel {
   private readonly _context: vscode.ExtensionContext;
   private _currentFileUri: vscode.Uri;
   private _disposables: vscode.Disposable[] = [];
+  private _isRunning = false;
 
   // ── Factory ──────────────────────────────────────────────────────────────
 
@@ -112,6 +112,7 @@ export class VisualizerPanel {
 
   static dispose(): void {
     VisualizerPanel._instance?.disposePanel();
+    _outputChannel.dispose();
   }
 
   // ── Constructor ──────────────────────────────────────────────────────────
@@ -130,17 +131,6 @@ export class VisualizerPanel {
 
     // Listen for panel disposal (user closed the tab).
     this._panel.onDidDispose(() => this.disposePanel(), null, this._disposables);
-
-    // Panel reveal triggers: re-send the trace if already loaded.
-    this._panel.onDidChangeViewState(
-      (e) => {
-        if (e.webviewPanel.visible) {
-          this._runTrace();
-        }
-      },
-      null,
-      this._disposables
-    );
 
     // Handle messages from the Webview.
     this._panel.webview.onDidReceiveMessage(
@@ -169,12 +159,20 @@ export class VisualizerPanel {
    * All errors surface as VS Code error notifications + Webview error banners.
    */
   private async _runTrace(): Promise<void> {
+    // Issue 4: prevent concurrent compiler and GDB processes from sharing output files.
+    if (this._isRunning) {
+      this._postMessage({ command: "STATUS", text: "Trace already running…" });
+      return;
+    }
+    this._isRunning = true;
+    try {
     const filePath   = this._currentFileUri.fsPath;
     const dir        = path.dirname(filePath);
 
-    // Output to Desktop — always writable on Windows, no spaces in path.
+    // Issue 8: keep generated files in VS Code's writable extension storage.
     const ext       = process.platform === 'win32' ? '.exe' : '.out';
-    const outDir    = path.join(os.homedir(), 'Desktop');
+    const outDir    = this._context.globalStorageUri.fsPath;
+    fs.mkdirSync(outDir, { recursive: true });
     const outBinary = path.join(outDir, `cvis_program${ext}`);
     const traceFile = path.join(outDir, `cvis_trace.json`);
 
@@ -254,6 +252,9 @@ export class VisualizerPanel {
       source: sourceText,
       filename: path.basename(filePath),
     });
+    } finally {
+      this._isRunning = false;
+    }
   }
 
   // ── Step implementations ─────────────────────────────────────────────────
@@ -263,16 +264,16 @@ export class VisualizerPanel {
     const cc     = cfg.get<string>("compiler", "gcc");
     const flags  = cfg.get<string>("compilerFlags", "-g -O0 -Wall");
 
-    // Use forward slashes for both paths — MinGW gcc handles them fine
-    // and avoids any backslash escaping issues in the shell command.
-    const srcFwd = src.replace(/\\/g, '/');
-    const outFwd = out.replace(/\\/g, '/');
-    const cmd    = `${cc} ${flags} "${srcFwd}" -o "${outFwd}"`;
+    // Issue 6: pass compiler inputs as argv so compiler flags cannot inject shell commands.
+    const flagArgs = flags.match(/(?:[^\s"]+|"[^"]*")+/g)?.map((flag) =>
+      flag.replace(/^"|"$/g, "")
+    ) ?? [];
+    const args = [...flagArgs, src, "-o", out];
 
-    _outputChannel.appendLine(`[gcc] cmd: ${cmd}`);
+    _outputChannel.appendLine(`[gcc] spawn: ${cc} ${JSON.stringify(args)}`);
 
     try {
-      const r = await execAsync(cmd, { timeout: 30_000 });
+      const r = await execFileAsync(cc, args, { timeout: 30_000 });
       _outputChannel.appendLine(`[gcc] exit ok, checking: ${out}`);
       return r;
     } catch (err) {
@@ -295,32 +296,49 @@ export class VisualizerPanel {
     const binaryFwd = binary.replace(/\\/g, '/');
     const traceFwd  = traceFile.replace(/\\/g, '/');
 
-    const env = { ...process.env, CVIS_TRACE_OUT: traceFwd };
+    // Issue 9: propagate the configured trace step limit into GDB's Python child.
+    const env = {
+      ...process.env,
+      CVIS_TRACE_OUT: traceFwd,
+      CVIS_MAX_STEPS: String(cfg.get<number>("maxSteps", 5000)),
+    };
 
     _outputChannel.appendLine(`[GDB] tracer : ${tracerFwd}`);
     _outputChannel.appendLine(`[GDB] binary : ${binaryFwd}`);
     _outputChannel.appendLine(`[GDB] trace  : ${traceFwd}`);
 
     return new Promise<ShellResult>((resolve) => {
-      const { spawn } = require("child_process") as typeof import("child_process");
-
       // Pass args as array — no shell quoting issues at all.
-      const args = ["-batch", "-ex", `source ${tracerFwd}`, binaryFwd];
+      // Issue 7: quote tracer paths so GDB can source files whose paths contain spaces.
+      const args = ["-batch", "-ex", `source "${tracerFwd}"`, binaryFwd];
       _outputChannel.appendLine(`[GDB] spawn  : ${gdbBin} ${JSON.stringify(args)}`);
 
       let stdout = "";
       let stderr = "";
+      let settled = false;
+      // Issue 10: make timeout failures explicit and clear the timer on every exit path.
+      let timeoutHandle: ReturnType<typeof setTimeout>;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        resolve({ stdout, stderr });
+      };
       const proc = spawn(gdbBin, args, { cwd, env });
 
       proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
       proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
       proc.on("error", (err: Error) => {
         stderr += `\nspawn error: ${err.message}`;
-        resolve({ stdout, stderr });
+        finish();
       });
-      proc.on("close", () => resolve({ stdout, stderr }));
+      proc.on("close", finish);
 
-      setTimeout(() => { try { proc.kill(); } catch (_) {} }, GDB_TIMEOUT_MS);
+      timeoutHandle = setTimeout(() => {
+        stderr += "\n[cVisualizer] GDB timed out after 120s -- the traced program is likely waiting on input (scanf) or stuck in an infinite loop";
+        try { proc.kill(); } catch (_) {}
+        finish();
+      }, GDB_TIMEOUT_MS);
     });
   }
 
@@ -556,16 +574,6 @@ export class VisualizerPanel {
       line-height: 1.6;
       white-space: pre;
       counter-reset: lines;
-    }
-    .src-line { display: flex; }
-    .src-line.active { background: rgba(124,106,247,0.18); border-left: 2px solid var(--accent); }
-    .ln {
-      user-select: none;
-      color: var(--muted);
-      min-width: 36px;
-      padding-right: 10px;
-      text-align: right;
-      flex-shrink: 0;
     }
     /* Stack pane */
     #pane-stack { grid-column: 2; grid-row: 1; }
@@ -808,8 +816,10 @@ export class VisualizerPanel {
           const hex = b.toString(16).padStart(2, "0");
           return \`<span class="hex-cell\${b !== 0 ? " nonzero" : ""}">\${hex}</span>\`;
         }).join("");
+        // Issue 12: show when the heap bytes were limited by the tracer snapshot cap.
+        const truncated = block.truncated ? " <span style=\"color:var(--muted)\">(truncated)</span>" : "";
         return \`<div class="heap-block">
-          <div class="heap-header">\${esc(block.address)}  <span style="color:var(--muted)">\${block.size} bytes</span></div>
+          <div class="heap-header">\${esc(block.address)}  <span style="color:var(--muted)">\${block.size} bytes</span>\${truncated}</div>
           <div class="hex-grid">\${hexCells}</div>
         </div>\`;
       }).join("");
@@ -821,7 +831,8 @@ export class VisualizerPanel {
       if (v === null || v === undefined) return "<span style='color:var(--muted)'>—</span>";
       if (typeof v !== "object") return esc(String(v));
       if (v.value === "NULL")    return "<span style='color:var(--error)'>NULL</span>";
-      if (v.string_value != null) return esc(\`"\${v.string_value}"\`);
+      // Issue 12: render the tracer's recursive pointer target instead of hiding it.
+      if (v.points_to != null) return \`-&gt; \${formatValue(v.points_to)}\`;
       if (Array.isArray(v.value)) return \`[\${v.value.length} elements]\`;
       if (v.value !== null && typeof v.value === "object") return \`{ … }\`;
       return esc(String(v.value ?? "?"));

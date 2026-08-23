@@ -9,8 +9,11 @@ import json
 import os
 import traceback
 
-# ── Tunables ─────────────────────────────────────────────────────────────────
-MAX_STEPS      = 5_000
+# Issue 2: honor the extension's configured maximum trace length.
+try:
+    MAX_STEPS = int(os.environ.get("CVIS_MAX_STEPS", "5000"))
+except ValueError:
+    MAX_STEPS = 5_000
 MAX_STR_LEN    = 256
 MAX_ARRAY_LEN  = 32
 MAX_HEAP_BYTES = 512
@@ -134,7 +137,11 @@ def heap_snapshot():
             bytes_ = list(bytes(raw))
         except Exception:
             bytes_ = []
-        snap.append({"address": addr_s, "size": size, "bytes": bytes_})
+        entry = {"address": addr_s, "size": size, "bytes": bytes_}
+        # Issue 3: mark heap buffers whose captured bytes are only a partial snapshot.
+        if size > MAX_HEAP_BYTES:
+            entry["truncated"] = True
+        snap.append(entry)
     return snap
 
 
@@ -212,26 +219,30 @@ class ReallocFinish(gdb.FinishBreakpoint):
 
 class MallocBP(gdb.Breakpoint):
     def stop(self):
-        try: MallocFinish(int(gdb.parse_and_eval("$rdi")))
-        except Exception: pass
+        # Issue 1: read malloc's size from the Microsoft x64 first argument register.
+        try: MallocFinish(int(gdb.parse_and_eval("$rcx")))
+        except Exception as e: print(f"[tracer] heap bp malloc failed: {e}")
         return False
 
 class CallocBP(gdb.Breakpoint):
     def stop(self):
-        try: CallocFinish(int(gdb.parse_and_eval("$rdi")) * int(gdb.parse_and_eval("$rsi")))
-        except Exception: pass
+        # Issue 1: read calloc's arguments from the Microsoft x64 argument registers.
+        try: CallocFinish(int(gdb.parse_and_eval("$rcx")) * int(gdb.parse_and_eval("$rdx")))
+        except Exception as e: print(f"[tracer] heap bp calloc failed: {e}")
         return False
 
 class ReallocBP(gdb.Breakpoint):
     def stop(self):
-        try: ReallocFinish(hex(int(gdb.parse_and_eval("$rdi"))), int(gdb.parse_and_eval("$rsi")))
-        except Exception: pass
+        # Issue 1: read realloc's pointer and size from the Microsoft x64 registers.
+        try: ReallocFinish(hex(int(gdb.parse_and_eval("$rcx"))), int(gdb.parse_and_eval("$rdx")))
+        except Exception as e: print(f"[tracer] heap bp realloc failed: {e}")
         return False
 
 class FreeBP(gdb.Breakpoint):
     def stop(self):
-        try: heap_registry.pop(hex(int(gdb.parse_and_eval("$rdi"))), None)
-        except Exception: pass
+        # Issue 1: read free's pointer from the Microsoft x64 first argument register.
+        try: heap_registry.pop(hex(int(gdb.parse_and_eval("$rcx"))), None)
+        except Exception as e: print(f"[tracer] heap bp free failed: {e}")
         return False
 
 
