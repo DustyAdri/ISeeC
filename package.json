@@ -1,0 +1,113 @@
+{
+  "name": "c-execution-visualizer",
+  "displayName": "C Execution Visualizer",
+  "description": "Step-by-step C execution visualizer powered by GDB — shows call stack, locals, and heap at every step.",
+  "version": "0.1.0",
+  "publisher": "your-publisher-id",
+  "license": "MIT",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Debuggers", "Education", "Visualization"],
+  "keywords": ["C", "GDB", "debugger", "visualizer", "PythonTutor"],
+  "icon": "media/icon.png",
+  "repository": { "type": "git", "url": "https://github.com/your-org/c-execution-visualizer" },
+
+  "activationEvents": [],
+
+  "main": "./out/extension.js",
+
+  "contributes": {
+    "commands": [
+      {
+        "command": "cVisualizer.start",
+        "title": "Visualize C Execution",
+        "category": "C Visualizer",
+        "icon": "$(play)"
+      },
+      {
+        "command": "cVisualizer.rerun",
+        "title": "Re-run Trace",
+        "category": "C Visualizer",
+        "icon": "$(refresh)"
+      }
+    ],
+
+    "menus": {
+      "editor/context": [
+        {
+          "command": "cVisualizer.start",
+          "when": "resourceLangId == c",
+          "group": "navigation@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "cVisualizer.start",
+          "when": "resourceLangId == c",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "cVisualizer.start",
+          "when": "resourceLangId == c || editorLangId == c"
+        },
+        {
+          "command": "cVisualizer.rerun"
+        }
+      ]
+    },
+
+    "keybindings": [
+      {
+        "command": "cVisualizer.start",
+        "key": "ctrl+shift+v",
+        "mac": "cmd+shift+v",
+        "when": "resourceLangId == c"
+      }
+    ],
+
+    "configuration": {
+      "title": "C Execution Visualizer",
+      "properties": {
+        "cVisualizer.compiler": {
+          "type": "string",
+          "default": "gcc",
+          "description": "C compiler executable (gcc, clang, …)"
+        },
+        "cVisualizer.compilerFlags": {
+          "type": "string",
+          "default": "-g -O0 -Wall",
+          "description": "Flags passed to the compiler. -g and -O0 are required for accurate traces."
+        },
+        "cVisualizer.gdbPath": {
+          "type": "string",
+          "default": "gdb",
+          "description": "Path to the GDB executable."
+        },
+        "cVisualizer.maxSteps": {
+          "type": "number",
+          "default": 50000,
+          "description": "Maximum execution steps captured by tracer.py."
+        }
+      }
+    }
+  },
+
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package"
+  },
+
+  "devDependencies": {
+    "@types/node": "^20.11.5",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.19.1",
+    "@typescript-eslint/parser": "^6.19.1",
+    "@vscode/vsce": "^2.23.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.3.3"
+  }
+}
