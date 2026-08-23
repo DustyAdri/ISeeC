@@ -1,4 +1,4 @@
-# C Execution Visualizer — Setup Guide
+# Setup Guide
 
 A VS Code extension that visualizes C program execution step-by-step, similar to PythonTutor.
 
