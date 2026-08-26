@@ -68,7 +68,9 @@ export class VisualizerPanel {
   private readonly _context: vscode.ExtensionContext;
   private _currentFileUri: vscode.Uri;
   private _disposables: vscode.Disposable[] = [];
-  private _isRunning = false;
+  private _isRunning   = false;
+  private _traceLoaded = false;
+  private _lastTrace: { data: TraceFile; source: string; filename: string } | undefined;
 
   // ── Factory ──────────────────────────────────────────────────────────────
 
@@ -159,17 +161,16 @@ export class VisualizerPanel {
    * All errors surface as VS Code error notifications + Webview error banners.
    */
   private async _runTrace(): Promise<void> {
-    // Issue 4: prevent concurrent compiler and GDB processes from sharing output files.
     if (this._isRunning) {
       this._postMessage({ command: "STATUS", text: "Trace already running…" });
       return;
     }
     this._isRunning = true;
+    this._traceLoaded = false;
     try {
     const filePath   = this._currentFileUri.fsPath;
     const dir        = path.dirname(filePath);
 
-    // Issue 8: keep generated files in VS Code's writable extension storage.
     const ext       = process.platform === 'win32' ? '.exe' : '.out';
     const outDir    = this._context.globalStorageUri.fsPath;
     fs.mkdirSync(outDir, { recursive: true });
@@ -186,7 +187,7 @@ export class VisualizerPanel {
     _outputChannel.appendLine(`[cVisualizer] Binary:  ${outBinary}`);
     _outputChannel.appendLine(`[cVisualizer] Trace:   ${traceFile}`);
     _outputChannel.appendLine(`[cVisualizer] Tracer:  ${tracerPath}`);
-    _outputChannel.show(true);   // open output panel so user sees logs
+    _outputChannel.show(true);
 
     this._postMessage({ command: "STATUS", text: "Compiling…" });
 
@@ -246,6 +247,10 @@ export class VisualizerPanel {
       sourceText = fs.readFileSync(filePath, "utf8");
     } catch (_) {}
 
+    // Cache the trace so READY can replay it without re-running GDB.
+    this._lastTrace  = { data: traceData, source: sourceText, filename: path.basename(filePath) };
+    this._traceLoaded = true;
+
     this._postMessage({
       command: "LOAD_TRACE",
       data: traceData,
@@ -264,7 +269,6 @@ export class VisualizerPanel {
     const cc     = cfg.get<string>("compiler", "gcc");
     const flags  = cfg.get<string>("compilerFlags", "-g -O0 -Wall");
 
-    // Issue 6: pass compiler inputs as argv so compiler flags cannot inject shell commands.
     const flagArgs = flags.match(/(?:[^\s"]+|"[^"]*")+/g)?.map((flag) =>
       flag.replace(/^"|"$/g, "")
     ) ?? [];
@@ -296,7 +300,6 @@ export class VisualizerPanel {
     const binaryFwd = binary.replace(/\\/g, '/');
     const traceFwd  = traceFile.replace(/\\/g, '/');
 
-    // Issue 9: propagate the configured trace step limit into GDB's Python child.
     const env = {
       ...process.env,
       CVIS_TRACE_OUT: traceFwd,
@@ -308,15 +311,12 @@ export class VisualizerPanel {
     _outputChannel.appendLine(`[GDB] trace  : ${traceFwd}`);
 
     return new Promise<ShellResult>((resolve) => {
-      // Pass args as array — no shell quoting issues at all.
-      // Issue 7: quote tracer paths so GDB can source files whose paths contain spaces.
-      const args = ["-batch", "-ex", `source "${tracerFwd}"`, binaryFwd];
+      const args = ["-batch", "--command", tracerFwd, binaryFwd];
       _outputChannel.appendLine(`[GDB] spawn  : ${gdbBin} ${JSON.stringify(args)}`);
 
       let stdout = "";
       let stderr = "";
       let settled = false;
-      // Issue 10: make timeout failures explicit and clear the timer on every exit path.
       let timeoutHandle: ReturnType<typeof setTimeout>;
       const finish = () => {
         if (settled) return;
@@ -394,8 +394,17 @@ export class VisualizerPanel {
   private _handleWebviewMessage(msg: WebviewToHostMessage): void {
     switch (msg.command) {
       case "READY":
-        // Webview signals it has bootstrapped; send the last trace if available.
-        this._runTrace();
+        if (this._traceLoaded && this._lastTrace) {
+          // Webview just (re)loaded — push the cached trace, no GDB rerun needed.
+          this._postMessage({
+            command: "LOAD_TRACE",
+            data: this._lastTrace.data,
+            source: this._lastTrace.source,
+            filename: this._lastTrace.filename,
+          });
+        } else if (!this._isRunning) {
+          this._runTrace();
+        }
         break;
 
       case "RERUN":
@@ -403,14 +412,10 @@ export class VisualizerPanel {
         break;
 
       case "JUMP_TO_STEP":
-        // The Webview manages its own step pointer; this is a no-op on the
-        // host side unless you want to sync with e.g. editor gutter highlights.
         this._syncEditorToStep(msg.step);
         break;
 
       case "INSPECT_MEMORY": {
-        // The Webview asked for raw bytes at a specific address.
-        // In a real implementation this would re-enter GDB; here we stub it.
         const bytes = this._stubReadMemory(msg.address, msg.byteCount);
         this._postMessage({
           command: "MEMORY_REGION",
@@ -421,7 +426,6 @@ export class VisualizerPanel {
       }
 
       case "LOG":
-        // Forward Webview console logs into the VS Code output channel.
         _outputChannel.appendLine(`[webview][${msg.level}] ${msg.text}`);
         break;
 
@@ -430,36 +434,19 @@ export class VisualizerPanel {
     }
   }
 
-  /**
-   * Highlight the source line corresponding to the active trace step
-   * in the text editor (optional UX enhancement).
-   */
   private _syncEditorToStep(step: number): void {
-    // Implement if you want gutter decorations synced to the timeline slider.
     void step;
   }
 
-  /**
-   * Stub: In a real build this would spawn a second GDB --interpreter=mi
-   * session to read memory at runtime. Returning empty bytes for now.
-   */
   private _stubReadMemory(_address: string, byteCount: number): number[] {
     return new Array<number>(byteCount).fill(0);
   }
 
   // ── HTML shell ───────────────────────────────────────────────────────────
 
-  /**
-   * Returns the full HTML document injected into the Webview iframe.
-   * The actual React/Svelte/vanilla app is expected to be bundled at
-   * media/webview.js; here we ship a self-contained fallback UI so the
-   * extension is immediately useful even without a bundled front-end.
-   */
   private _buildWebviewHtml(): string {
     const webview = this._panel.webview;
 
-    // Resolve media URIs through the VS Code Webview URI transformer so
-    // the browser sandbox permits loading them.
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this._context.extensionUri, "media", "webview.js")
     );
@@ -467,7 +454,6 @@ export class VisualizerPanel {
       vscode.Uri.joinPath(this._context.extensionUri, "media", "webview.css")
     );
 
-    // Content Security Policy — tightened to only allow extension-origin scripts.
     const nonce = _generateNonce();
     const csp = [
       `default-src 'none'`,
@@ -475,6 +461,14 @@ export class VisualizerPanel {
       `script-src 'nonce-${nonce}'`,
       `font-src ${webview.cspSource}`,
     ].join("; ");
+
+    // Only emit the override script tag if the file actually exists.
+    // A missing webview.js causes the CSP to block its failed load response,
+    // which can prevent the inline script from completing on some webview versions.
+    const webviewJsPath = path.join(this._context.extensionPath, "media", "webview.js");
+    const webviewJsTag = fs.existsSync(webviewJsPath)
+      ? `<script nonce="${nonce}" src="${scriptUri}"></script>`
+      : `<!-- media/webview.js not bundled, using inline fallback UI -->`;
 
     return /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -566,7 +560,6 @@ export class VisualizerPanel {
       color: var(--muted);
       margin-bottom: 8px;
     }
-    /* Source pane */
     #pane-source { grid-column: 1; grid-row: 1 / 3; }
     pre#source-code {
       font-family: var(--mono);
@@ -575,7 +568,6 @@ export class VisualizerPanel {
       white-space: pre;
       counter-reset: lines;
     }
-    /* Stack pane */
     #pane-stack { grid-column: 2; grid-row: 1; }
     .frame { margin-bottom: 10px; }
     .frame-header {
@@ -594,10 +586,62 @@ export class VisualizerPanel {
       padding: 2px 0;
       border-bottom: 1px solid var(--border);
     }
-    .local-name  { color: var(--text); }
-    .local-type  { color: var(--muted); }
+    .local-name  { color: var(--text); font-weight: 600; }
+    .local-type  { color: var(--muted); font-size: 10px; }
     .local-value { color: var(--success); word-break: break-all; }
-    /* Heap pane */
+
+    /* Local variable block (replaces flat row for complex values) */
+    .local-block { margin-bottom: 8px; }
+    .local-header { display: flex; gap: 8px; align-items: baseline; margin-bottom: 3px; }
+    .local-value-wrap { padding-left: 4px; }
+
+    /* Array rendering */
+    .arr-wrap { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 2px; }
+    .arr-cell {
+      display: flex; flex-direction: column; align-items: center;
+      border: 1px solid var(--border); border-radius: 3px;
+      background: var(--surface); min-width: 32px;
+    }
+    .arr-idx { font-size: 9px; color: var(--muted); padding: 1px 4px; border-bottom: 1px solid var(--border); width: 100%; text-align: center; }
+    .arr-val { font-family: var(--mono); font-size: 11px; padding: 3px 6px; color: var(--success); }
+
+    /* Uninitialized / garbage values */
+    .val-uninit {
+      font-family: var(--mono); font-size: 11px;
+      color: #888; background: repeating-linear-gradient(
+        45deg, rgba(255,255,255,0.03), rgba(255,255,255,0.03) 2px,
+        transparent 2px, transparent 6px
+      );
+      padding: 1px 5px; border-radius: 2px; border: 1px dashed #555;
+      cursor: help;
+    }
+
+    /* Value types */
+    .val-prim   { font-family: var(--mono); font-size: 11px; color: var(--success); }
+    .val-string { font-family: var(--mono); font-size: 11px; color: #f6c90e; }
+    .val-null   { font-family: var(--mono); font-size: 11px; color: var(--error); font-weight: 600; }
+    .val-ptr    { font-family: var(--mono); font-size: 11px; color: var(--accent); }
+    .val-muted  { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+
+    /* Struct rendering */
+    .struct-wrap { display: flex; flex-direction: column; gap: 2px; border-left: 2px solid var(--border); padding-left: 8px; }
+    .struct-row  { display: flex; gap: 6px; font-family: var(--mono); font-size: 11px; }
+    .struct-field { color: var(--muted); min-width: 60px; }
+    .struct-val   { color: var(--success); }
+
+    /* Linked list rendering */
+    .ll-wrap  { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 2px; }
+    .ll-node  {
+      border: 1px solid var(--accent); border-radius: 4px;
+      background: rgba(124,106,247,0.08); padding: 4px 8px;
+      font-family: var(--mono); font-size: 11px;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .ll-field { display: flex; gap: 6px; }
+    .ll-arrow { color: var(--accent); font-size: 14px; font-weight: bold; align-self: center; }
+
+    /* Heap typed value */
+    .heap-typed { padding: 4px 0; }
     #pane-heap { grid-column: 2; grid-row: 2; }
     .heap-block { margin-bottom: 10px; }
     .heap-header { font-family: var(--mono); font-size: 11px; color: var(--accent); margin-bottom: 4px; }
@@ -617,7 +661,6 @@ export class VisualizerPanel {
       color: var(--text);
     }
     .hex-cell.nonzero { background: rgba(124,106,247,0.25); color: var(--accent); }
-    /* Error banner */
     #error-banner {
       display: none;
       background: rgba(248,113,113,0.12);
@@ -630,8 +673,6 @@ export class VisualizerPanel {
       flex-shrink: 0;
     }
     #error-banner.visible { display: block; }
-
-    /* ── Source viewer ── */
     #source-code { padding: 0; margin: 0; overflow: auto; height: 100%; }
     .source-line { display: flex; font-family: monospace; font-size: 12px; line-height: 1.6; padding: 0 8px; }
     .source-line:hover { background: rgba(255,255,255,0.05); }
@@ -736,7 +777,7 @@ export class VisualizerPanel {
     function loadTrace(data, source, filename) {
       trace = data;
       currentStep = 0;
-      sourceLines = source ? source.split("\n") : [];
+      sourceLines = source ? source.split("\\n") : [];
 
       const total = (trace.timeline || []).length;
       slider.max   = Math.max(0, total - 1);
@@ -795,11 +836,12 @@ export class VisualizerPanel {
       if (!frames.length) { stackEl.innerHTML = "<span style='color:var(--muted)'>No frames</span>"; return; }
       stackEl.innerHTML = frames.map(frame => {
         const localsHtml = (frame.locals || []).map(loc => {
-          const val = formatValue(loc.value);
-          return \`<div class="local-row">
-            <span class="local-name">\${esc(loc.name)}</span>
-            <span class="local-type">\${esc(loc.type)}</span>
-            <span class="local-value">\${val}</span>
+          return \`<div class="local-block">
+            <div class="local-header">
+              <span class="local-name">\${esc(loc.name)}</span>
+              <span class="local-type">\${esc(loc.type)}</span>
+            </div>
+            <div class="local-value-wrap">\${renderValue(loc.value)}</div>
           </div>\`;
         }).join("");
         return \`<div class="frame">
@@ -812,30 +854,111 @@ export class VisualizerPanel {
     function renderHeap(blocks) {
       if (!blocks.length) { heapEl.innerHTML = "<span style='color:var(--muted)'>No heap allocations</span>"; return; }
       heapEl.innerHTML = blocks.map(block => {
+        const truncated = block.truncated ? \` <span style="color:var(--muted)">(truncated)</span>\` : "";
+        const header = \`<div class="heap-header">\${esc(block.address)} <span style="color:var(--muted)">\${block.size} bytes</span>\${truncated}</div>\`;
+        // If tracer resolved a typed value (struct, linked list etc), show that
+        if (block.typed_value) {
+          return \`<div class="heap-block">\${header}<div class="heap-typed">\${renderValue(block.typed_value)}</div></div>\`;
+        }
+        // Otherwise fall back to hex bytes
         const hexCells = (block.bytes || []).slice(0, 128).map(b => {
           const hex = b.toString(16).padStart(2, "0");
           return \`<span class="hex-cell\${b !== 0 ? " nonzero" : ""}">\${hex}</span>\`;
         }).join("");
-        // Issue 12: show when the heap bytes were limited by the tracer snapshot cap.
-        const truncated = block.truncated ? " <span style=\"color:var(--muted)\">(truncated)</span>" : "";
-        return \`<div class="heap-block">
-          <div class="heap-header">\${esc(block.address)}  <span style="color:var(--muted)">\${block.size} bytes</span>\${truncated}</div>
-          <div class="hex-grid">\${hexCells}</div>
-        </div>\`;
+        return \`<div class="heap-block">\${header}<div class="hex-grid">\${hexCells}</div></div>\`;
       }).join("");
     }
 
-    // ── Value formatter ───────────────────────────────────────────────────
+    // ── Rich value renderer ────────────────────────────────────────────────
+    // Renders the new tracer format (objects with a "kind" field).
+    // Falls back gracefully for old-format values.
 
-    function formatValue(v) {
-      if (v === null || v === undefined) return "<span style='color:var(--muted)'>—</span>";
-      if (typeof v !== "object") return esc(String(v));
-      if (v.value === "NULL")    return "<span style='color:var(--error)'>NULL</span>";
-      // Issue 12: render the tracer's recursive pointer target instead of hiding it.
-      if (v.points_to != null) return \`-&gt; \${formatValue(v.points_to)}\`;
-      if (Array.isArray(v.value)) return \`[\${v.value.length} elements]\`;
-      if (v.value !== null && typeof v.value === "object") return \`{ … }\`;
-      return esc(String(v.value ?? "?"));
+    function renderValue(v) {
+      if (v === null || v === undefined) return \`<span class="val-null">—</span>\`;
+      // Old format fallback (plain string/number)
+      if (typeof v !== "object") return \`<span class="val-prim">\${esc(String(v))}</span>\`;
+
+      switch (v.kind) {
+        case "primitive": {
+          if (v.uninit) return \`<span class="val-uninit" title="Uninitialized / garbage">?</span>\`;
+          if (v.value === "NULL") return \`<span class="val-null">NULL</span>\`;
+          return \`<span class="val-prim">\${esc(String(v.value))}</span>\`;
+        }
+        case "string":
+          return \`<span class="val-string">\${esc(v.value)}</span>\`;
+        case "pointer":
+          if (v.value === "NULL") return \`<span class="val-null">NULL</span>\`;
+          if (v.points_to)        return \`<span class="val-ptr">→</span> \${renderValue(v.points_to)}\`;
+          return \`<span class="val-ptr">\${esc(v.address || "?")}</span>\`;
+        case "array":
+          return renderArray(v);
+        case "struct":
+          return renderStruct(v);
+        case "linked_list":
+          return renderLinkedList(v);
+        case "truncated":
+          return \`<span class="val-muted">&lt;max depth&gt;</span>\`;
+        case "error":
+          return \`<span class="val-muted">&lt;\${esc(v.value)}&gt;</span>\`;
+        case "cycle":
+          return \`<span class="val-muted">↩ cycle @ \${esc(v.address)}</span>\`;
+        default:
+          // Old format: {value, points_to} objects
+          if (v.value === "NULL")  return \`<span class="val-null">NULL</span>\`;
+          if (v.points_to != null) return \`<span class="val-ptr">→</span> \${renderValue(v.points_to)}\`;
+          if (Array.isArray(v.value)) return renderArray({ kind:"array", elements: v.value, length: v.value.length });
+          return \`<span class="val-prim">\${esc(String(v.value ?? "?"))}</span>\`;
+      }
+    }
+
+    function renderArray(v) {
+      const els = v.elements || v.value || [];
+      const cells = els.map((el, i) => {
+        const isUninit = el && el.uninit;
+        const cellVal  = isUninit
+          ? \`<span class="val-uninit" title="Uninitialized">?</span>\`
+          : renderValue(el);
+        return \`<div class="arr-cell">
+          <div class="arr-idx">\${i}</div>
+          <div class="arr-val">\${cellVal}</div>
+        </div>\`;
+      }).join("");
+      return \`<div class="arr-wrap">\${cells}</div>\`;
+    }
+
+    function renderStruct(v) {
+      const fields = v.fields || {};
+      const rows = Object.entries(fields).map(([name, val]) =>
+        \`<div class="struct-row">
+          <span class="struct-field">\${esc(name)}</span>
+          <span class="struct-val">\${renderValue(val)}</span>
+        </div>\`
+      ).join("");
+      return \`<div class="struct-wrap">\${rows || "<span class='val-muted'>empty</span>"}</div>\`;
+    }
+
+    function renderLinkedList(v) {
+      const nodes = v.nodes || [];
+      if (!nodes.length) return \`<span class="val-null">NULL</span>\`;
+      const nodeHtml = nodes.map((node, i) => {
+        if (node.kind === "cycle") return \`<span class="val-muted">↩ cycle</span>\`;
+        if (node.kind === "error") return \`<span class="val-muted">error: \${esc(node.value)}</span>\`;
+        const fields = node.fields || {};
+        const rows = Object.entries(fields).map(([name, fval]) => {
+          // Skip the next-pointer field in the node box (it's shown as the arrow)
+          const isNextPtr = fval && fval.kind === "pointer" && (fval.value === "->" || fval.value === "NULL");
+          if (isNextPtr) return "";
+          return \`<div class="ll-field"><span class="struct-field">\${esc(name)}</span> <span class="struct-val">\${renderValue(fval)}</span></div>\`;
+        }).join("");
+        const arrow = i < nodes.length - 1 ? \`<span class="ll-arrow">→</span>\` : "";
+        return \`<div class="ll-node">\${rows || "<span class='val-muted'>·</span>"}</div>\${arrow}\`;
+      }).join("");
+      // Check if last node has a null next ptr — show terminator
+      const last = nodes[nodes.length - 1];
+      const hasNull = last && last.fields && Object.values(last.fields).some(
+        f => f && f.kind === "pointer" && f.value === "NULL"
+      );
+      return \`<div class="ll-wrap">\${nodeHtml}\${hasNull ? \`<span class="ll-arrow">→</span><span class="val-null">NULL</span>\` : ""}</div>\`;
     }
 
     // ── Utility ───────────────────────────────────────────────────────────
@@ -857,8 +980,7 @@ export class VisualizerPanel {
   })();
   </script>
 
-  <!-- If media/webview.js exists it can override the fallback UI above -->
-  <script nonce="${nonce}" src="${scriptUri}"></script>
+  ${webviewJsTag}
 </body>
 </html>`;
   }
