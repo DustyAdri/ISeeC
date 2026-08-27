@@ -11,13 +11,12 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
-import * as os from 'os';
 import * as crypto from 'crypto';
 
-import { exec, ExecException } from "child_process";
+import { execFile, spawn, ExecException } from "child_process";
 import { promisify } from "util";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -69,6 +68,10 @@ export class VisualizerPanel {
   private readonly _context: vscode.ExtensionContext;
   private _currentFileUri: vscode.Uri;
   private _disposables: vscode.Disposable[] = [];
+  private _isRunning    = false;
+  private _traceLoaded  = false;
+  private _webviewReady = false;
+  private _lastTrace: { data: TraceFile; source: string; filename: string } | undefined;
 
   // ── Factory ──────────────────────────────────────────────────────────────
 
@@ -112,6 +115,7 @@ export class VisualizerPanel {
 
   static dispose(): void {
     VisualizerPanel._instance?.disposePanel();
+    _outputChannel.dispose();
   }
 
   // ── Constructor ──────────────────────────────────────────────────────────
@@ -130,17 +134,6 @@ export class VisualizerPanel {
 
     // Listen for panel disposal (user closed the tab).
     this._panel.onDidDispose(() => this.disposePanel(), null, this._disposables);
-
-    // Panel reveal triggers: re-send the trace if already loaded.
-    this._panel.onDidChangeViewState(
-      (e) => {
-        if (e.webviewPanel.visible) {
-          this._runTrace();
-        }
-      },
-      null,
-      this._disposables
-    );
 
     // Handle messages from the Webview.
     this._panel.webview.onDidReceiveMessage(
@@ -169,12 +162,19 @@ export class VisualizerPanel {
    * All errors surface as VS Code error notifications + Webview error banners.
    */
   private async _runTrace(): Promise<void> {
+    if (this._isRunning) {
+      this._postMessage({ command: "STATUS", text: "Trace already running…" });
+      return;
+    }
+    this._isRunning = true;
+    this._traceLoaded = false;
+    try {
     const filePath   = this._currentFileUri.fsPath;
     const dir        = path.dirname(filePath);
 
-    // Output to Desktop — always writable on Windows, no spaces in path.
     const ext       = process.platform === 'win32' ? '.exe' : '.out';
-    const outDir    = path.join(os.homedir(), 'Desktop');
+    const outDir    = this._context.globalStorageUri.fsPath;
+    fs.mkdirSync(outDir, { recursive: true });
     const outBinary = path.join(outDir, `cvis_program${ext}`);
     const traceFile = path.join(outDir, `cvis_trace.json`);
 
@@ -188,7 +188,7 @@ export class VisualizerPanel {
     _outputChannel.appendLine(`[cVisualizer] Binary:  ${outBinary}`);
     _outputChannel.appendLine(`[cVisualizer] Trace:   ${traceFile}`);
     _outputChannel.appendLine(`[cVisualizer] Tracer:  ${tracerPath}`);
-    _outputChannel.show(true);   // open output panel so user sees logs
+    _outputChannel.show(true);
 
     this._postMessage({ command: "STATUS", text: "Compiling…" });
 
@@ -248,12 +248,21 @@ export class VisualizerPanel {
       sourceText = fs.readFileSync(filePath, "utf8");
     } catch (_) {}
 
-    this._postMessage({
-      command: "LOAD_TRACE",
-      data: traceData,
-      source: sourceText,
-      filename: path.basename(filePath),
-    });
+    // Cache the trace so READY can replay it without re-running GDB.
+    this._lastTrace  = { data: traceData, source: sourceText, filename: path.basename(filePath) };
+    this._traceLoaded = true;
+
+    if (this._webviewReady) {
+      this._postMessage({
+        command: "LOAD_TRACE",
+        data: traceData,
+        source: sourceText,
+        filename: path.basename(filePath),
+      });
+    }
+    } finally {
+      this._isRunning = false;
+    }
   }
 
   // ── Step implementations ─────────────────────────────────────────────────
@@ -263,16 +272,15 @@ export class VisualizerPanel {
     const cc     = cfg.get<string>("compiler", "gcc");
     const flags  = cfg.get<string>("compilerFlags", "-g -O0 -Wall");
 
-    // Use forward slashes for both paths — MinGW gcc handles them fine
-    // and avoids any backslash escaping issues in the shell command.
-    const srcFwd = src.replace(/\\/g, '/');
-    const outFwd = out.replace(/\\/g, '/');
-    const cmd    = `${cc} ${flags} "${srcFwd}" -o "${outFwd}"`;
+    const flagArgs = flags.match(/(?:[^\s"]+|"[^"]*")+/g)?.map((flag) =>
+      flag.replace(/^"|"$/g, "")
+    ) ?? [];
+    const args = [...flagArgs, src, "-o", out];
 
-    _outputChannel.appendLine(`[gcc] cmd: ${cmd}`);
+    _outputChannel.appendLine(`[gcc] spawn: ${cc} ${JSON.stringify(args)}`);
 
     try {
-      const r = await execAsync(cmd, { timeout: 30_000 });
+      const r = await execFileAsync(cc, args, { timeout: 30_000 });
       _outputChannel.appendLine(`[gcc] exit ok, checking: ${out}`);
       return r;
     } catch (err) {
@@ -295,32 +303,45 @@ export class VisualizerPanel {
     const binaryFwd = binary.replace(/\\/g, '/');
     const traceFwd  = traceFile.replace(/\\/g, '/');
 
-    const env = { ...process.env, CVIS_TRACE_OUT: traceFwd };
+    const env = {
+      ...process.env,
+      CVIS_TRACE_OUT: traceFwd,
+      CVIS_MAX_STEPS: String(cfg.get<number>("maxSteps", 5000)),
+    };
 
     _outputChannel.appendLine(`[GDB] tracer : ${tracerFwd}`);
     _outputChannel.appendLine(`[GDB] binary : ${binaryFwd}`);
     _outputChannel.appendLine(`[GDB] trace  : ${traceFwd}`);
 
     return new Promise<ShellResult>((resolve) => {
-      const { spawn } = require("child_process") as typeof import("child_process");
-
-      // Pass args as array — no shell quoting issues at all.
-      const args = ["-batch", "-ex", `source ${tracerFwd}`, binaryFwd];
+      const args = ["-batch", "--command", tracerFwd, binaryFwd];
       _outputChannel.appendLine(`[GDB] spawn  : ${gdbBin} ${JSON.stringify(args)}`);
 
       let stdout = "";
       let stderr = "";
+      let settled = false;
+      let timeoutHandle: ReturnType<typeof setTimeout>;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        resolve({ stdout, stderr });
+      };
       const proc = spawn(gdbBin, args, { cwd, env });
 
       proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
       proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
       proc.on("error", (err: Error) => {
         stderr += `\nspawn error: ${err.message}`;
-        resolve({ stdout, stderr });
+        finish();
       });
-      proc.on("close", () => resolve({ stdout, stderr }));
+      proc.on("close", finish);
 
-      setTimeout(() => { try { proc.kill(); } catch (_) {} }, GDB_TIMEOUT_MS);
+      timeoutHandle = setTimeout(() => {
+        stderr += "\n[cVisualizer] GDB timed out after 120s -- the traced program is likely waiting on input (scanf) or stuck in an infinite loop";
+        try { proc.kill(); } catch (_) {}
+        finish();
+      }, GDB_TIMEOUT_MS);
     });
   }
 
@@ -376,8 +397,18 @@ export class VisualizerPanel {
   private _handleWebviewMessage(msg: WebviewToHostMessage): void {
     switch (msg.command) {
       case "READY":
-        // Webview signals it has bootstrapped; send the last trace if available.
-        this._runTrace();
+        this._webviewReady = true;
+        if (this._traceLoaded && this._lastTrace) {
+          // Webview just (re)loaded — push the cached trace, no GDB rerun needed.
+          this._postMessage({
+            command: "LOAD_TRACE",
+            data: this._lastTrace.data,
+            source: this._lastTrace.source,
+            filename: this._lastTrace.filename,
+          });
+        } else if (!this._isRunning) {
+          this._runTrace();
+        }
         break;
 
       case "RERUN":
@@ -385,14 +416,10 @@ export class VisualizerPanel {
         break;
 
       case "JUMP_TO_STEP":
-        // The Webview manages its own step pointer; this is a no-op on the
-        // host side unless you want to sync with e.g. editor gutter highlights.
         this._syncEditorToStep(msg.step);
         break;
 
       case "INSPECT_MEMORY": {
-        // The Webview asked for raw bytes at a specific address.
-        // In a real implementation this would re-enter GDB; here we stub it.
         const bytes = this._stubReadMemory(msg.address, msg.byteCount);
         this._postMessage({
           command: "MEMORY_REGION",
@@ -403,7 +430,6 @@ export class VisualizerPanel {
       }
 
       case "LOG":
-        // Forward Webview console logs into the VS Code output channel.
         _outputChannel.appendLine(`[webview][${msg.level}] ${msg.text}`);
         break;
 
@@ -412,36 +438,19 @@ export class VisualizerPanel {
     }
   }
 
-  /**
-   * Highlight the source line corresponding to the active trace step
-   * in the text editor (optional UX enhancement).
-   */
   private _syncEditorToStep(step: number): void {
-    // Implement if you want gutter decorations synced to the timeline slider.
     void step;
   }
 
-  /**
-   * Stub: In a real build this would spawn a second GDB --interpreter=mi
-   * session to read memory at runtime. Returning empty bytes for now.
-   */
   private _stubReadMemory(_address: string, byteCount: number): number[] {
     return new Array<number>(byteCount).fill(0);
   }
 
   // ── HTML shell ───────────────────────────────────────────────────────────
 
-  /**
-   * Returns the full HTML document injected into the Webview iframe.
-   * The actual React/Svelte/vanilla app is expected to be bundled at
-   * media/webview.js; here we ship a self-contained fallback UI so the
-   * extension is immediately useful even without a bundled front-end.
-   */
   private _buildWebviewHtml(): string {
     const webview = this._panel.webview;
 
-    // Resolve media URIs through the VS Code Webview URI transformer so
-    // the browser sandbox permits loading them.
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this._context.extensionUri, "media", "webview.js")
     );
@@ -449,7 +458,6 @@ export class VisualizerPanel {
       vscode.Uri.joinPath(this._context.extensionUri, "media", "webview.css")
     );
 
-    // Content Security Policy — tightened to only allow extension-origin scripts.
     const nonce = _generateNonce();
     const csp = [
       `default-src 'none'`,
@@ -457,6 +465,14 @@ export class VisualizerPanel {
       `script-src 'nonce-${nonce}'`,
       `font-src ${webview.cspSource}`,
     ].join("; ");
+
+    // Only emit the override script tag if the file actually exists.
+    // A missing webview.js causes the CSP to block its failed load response,
+    // which can prevent the inline script from completing on some webview versions.
+    const webviewJsPath = path.join(this._context.extensionPath, "media", "webview.js");
+    const webviewJsTag = fs.existsSync(webviewJsPath)
+      ? `<script nonce="${nonce}" src="${scriptUri}"></script>`
+      : `<!-- media/webview.js not bundled, using inline fallback UI -->`;
 
     return /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -548,7 +564,6 @@ export class VisualizerPanel {
       color: var(--muted);
       margin-bottom: 8px;
     }
-    /* Source pane */
     #pane-source { grid-column: 1; grid-row: 1 / 3; }
     pre#source-code {
       font-family: var(--mono);
@@ -557,17 +572,6 @@ export class VisualizerPanel {
       white-space: pre;
       counter-reset: lines;
     }
-    .src-line { display: flex; }
-    .src-line.active { background: rgba(124,106,247,0.18); border-left: 2px solid var(--accent); }
-    .ln {
-      user-select: none;
-      color: var(--muted);
-      min-width: 36px;
-      padding-right: 10px;
-      text-align: right;
-      flex-shrink: 0;
-    }
-    /* Stack pane */
     #pane-stack { grid-column: 2; grid-row: 1; }
     .frame { margin-bottom: 10px; }
     .frame-header {
@@ -586,10 +590,74 @@ export class VisualizerPanel {
       padding: 2px 0;
       border-bottom: 1px solid var(--border);
     }
-    .local-name  { color: var(--text); }
-    .local-type  { color: var(--muted); }
+    .local-name  { color: var(--text); font-weight: 600; }
+    .local-type  { color: var(--muted); font-size: 10px; }
     .local-value { color: var(--success); word-break: break-all; }
-    /* Heap pane */
+
+    /* Local variable block (replaces flat row for complex values) */
+    .local-block { margin-bottom: 8px; }
+    .local-header { display: flex; gap: 8px; align-items: baseline; margin-bottom: 3px; }
+    .local-value-wrap { padding-left: 4px; }
+
+    /* Array rendering */
+    .arr-wrap { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 2px; }
+    .arr-cell {
+      display: flex; flex-direction: column; align-items: center;
+      border: 1px solid var(--border); border-radius: 3px;
+      background: var(--surface); min-width: 32px;
+    }
+    .arr-idx { font-size: 9px; color: var(--muted); padding: 1px 4px; border-bottom: 1px solid var(--border); width: 100%; text-align: center; }
+    .arr-val { font-family: var(--mono); font-size: 11px; padding: 3px 6px; color: var(--success); }
+
+    /* Uninitialized / garbage values */
+    .val-uninit {
+      font-family: var(--mono); font-size: 11px;
+      color: #888; background: repeating-linear-gradient(
+        45deg, rgba(255,255,255,0.03), rgba(255,255,255,0.03) 2px,
+        transparent 2px, transparent 6px
+      );
+      padding: 1px 5px; border-radius: 2px; border: 1px dashed #555;
+      cursor: help;
+    }
+
+    /* Value types */
+    .val-prim   { font-family: var(--mono); font-size: 11px; color: var(--success); }
+    .val-string { font-family: var(--mono); font-size: 11px; color: #f6c90e; }
+    .val-null   { font-family: var(--mono); font-size: 11px; color: var(--error); font-weight: 600; }
+    .val-ptr    { font-family: var(--mono); font-size: 11px; color: var(--accent); }
+    .val-muted  { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+
+    /* Heap reference badge — replaces inline node data for heap pointers in locals */
+    .val-heap-ref {
+      font-family: var(--mono); font-size: 10px;
+      color: var(--accent);
+      background: rgba(124,106,247,0.15);
+      border: 1px solid rgba(124,106,247,0.45);
+      border-radius: 3px; padding: 1px 6px;
+      cursor: pointer; user-select: none;
+    }
+    .val-heap-ref::before { content: "heap "; color: var(--muted); font-size: 9px; }
+    .val-heap-ref:hover { background: rgba(124,106,247,0.3); }
+
+    /* Struct rendering */
+    .struct-wrap { display: flex; flex-direction: column; gap: 2px; border-left: 2px solid var(--border); padding-left: 8px; }
+    .struct-row  { display: flex; gap: 6px; font-family: var(--mono); font-size: 11px; }
+    .struct-field { color: var(--muted); min-width: 60px; }
+    .struct-val   { color: var(--success); }
+
+    /* Linked list rendering */
+    .ll-wrap  { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 2px; }
+    .ll-node  {
+      border: 1px solid var(--accent); border-radius: 4px;
+      background: rgba(124,106,247,0.08); padding: 4px 8px;
+      font-family: var(--mono); font-size: 11px;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .ll-field { display: flex; gap: 6px; }
+    .ll-arrow { color: var(--accent); font-size: 14px; font-weight: bold; align-self: center; }
+
+    /* Heap typed value */
+    .heap-typed { padding: 4px 0; }
     #pane-heap { grid-column: 2; grid-row: 2; }
     .heap-block { margin-bottom: 10px; }
     .heap-header { font-family: var(--mono); font-size: 11px; color: var(--accent); margin-bottom: 4px; }
@@ -609,7 +677,6 @@ export class VisualizerPanel {
       color: var(--text);
     }
     .hex-cell.nonzero { background: rgba(124,106,247,0.25); color: var(--accent); }
-    /* Error banner */
     #error-banner {
       display: none;
       background: rgba(248,113,113,0.12);
@@ -622,12 +689,14 @@ export class VisualizerPanel {
       flex-shrink: 0;
     }
     #error-banner.visible { display: block; }
-
-    /* ── Source viewer ── */
     #source-code { padding: 0; margin: 0; overflow: auto; height: 100%; }
     .source-line { display: flex; font-family: monospace; font-size: 12px; line-height: 1.6; padding: 0 8px; }
     .source-line:hover { background: rgba(255,255,255,0.05); }
     .active-line { background: rgba(255,215,0,0.18) !important; border-left: 3px solid #ffd700; }
+    /* PT-style dual highlights */
+    .line-prev { background: rgba(144,238,144,0.12) !important; border-left: 3px solid #4caf50; }
+    .line-next { background: rgba(255,80,80,0.15)   !important; border-left: 3px solid #f44336; }
+    .line-arrow { width: 14px; flex-shrink: 0; font-size: 9px; display: flex; align-items: center; }
     .line-num { color: var(--muted); min-width: 36px; user-select: none; text-align: right; padding-right: 12px; }
     .line-text { white-space: pre; flex: 1; }
   </style>
@@ -647,6 +716,16 @@ export class VisualizerPanel {
   </div>
 
   <div id="error-banner" role="alert"></div>
+
+  <!-- Fixed SVG arrow overlay — sits above everything, pointer-events:none -->
+  <svg id="arrow-overlay" xmlns="http://www.w3.org/2000/svg"
+       style="position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:999;overflow:visible">
+    <defs>
+      <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#7c6af7" opacity="0.85"/>
+      </marker>
+    </defs>
+  </svg>
 
   <div id="main">
     <div class="pane" id="pane-source">
@@ -728,7 +807,7 @@ export class VisualizerPanel {
     function loadTrace(data, source, filename) {
       trace = data;
       currentStep = 0;
-      sourceLines = source ? source.split("\n") : [];
+      sourceLines = source ? source.split("\\n") : [];
 
       const total = (trace.timeline || []).length;
       slider.max   = Math.max(0, total - 1);
@@ -750,48 +829,94 @@ export class VisualizerPanel {
 
     function renderStep(n) {
       if (!trace || !trace.timeline[n]) return;
-      const step = trace.timeline[n];
-      const total = trace.timeline.length;
+      const step     = trace.timeline[n];
+      const nextStep = trace.timeline[n + 1];
+      const total    = trace.timeline.length;
 
       stepLabel.textContent = \`Step \${n + 1} / \${total}  ·  \${step.event || ""}\`;
-
       if (step.file) {
         const short = step.file.split("/").pop();
         setStatus(\`\${short}:\${step.line}  (step \${n + 1}/\${total})\`);
       }
 
-      renderSource(step.line || 0);
+      const justLine = step.line || 0;
+      const nextLine = nextStep ? (nextStep.line || 0) : 0;
+      renderSource(justLine, nextLine);
       renderStack(step.stack || []);
       renderHeap(step.heap  || []);
+      requestAnimationFrame(drawArrows);
     }
 
-    function renderSource(currentLine) {
+    function renderSource(justLine, nextLine) {
       if (!sourceLines.length) {
         sourceEl.innerHTML = "<span style='color:var(--muted)'>No source available.</span>";
         return;
       }
-      const html = sourceLines.map((line, i) => {
-        const lineNum = i + 1;
-        const isActive = lineNum === currentLine;
-        return \`<div class="source-line\${isActive ? " active-line" : ""}" id="src-\${lineNum}">\` +
-               \`<span class="line-num">\${lineNum}</span>\` +
-               \`<span class="line-text">\${esc(line) || " "}</span>\` +
-               \`</div>\`;
+      sourceEl.innerHTML = sourceLines.map((line, i) => {
+        const ln     = i + 1;
+        const isJust = ln === justLine;
+        const isNext = ln === nextLine && nextLine !== justLine;
+        const cls    = isJust ? " line-prev" : isNext ? " line-next" : "";
+        const arrow  = isJust
+          ? \`<span class="line-arrow" style="color:#4caf50">▶</span>\`
+          : isNext
+            ? \`<span class="line-arrow" style="color:#f44336">▶</span>\`
+            : \`<span class="line-arrow"></span>\`;
+        return \`<div class="source-line\${cls}">\${arrow}<span class="line-num">\${ln}</span><span class="line-text">\${esc(line) || " "}</span></div>\`;
       }).join("");
-      sourceEl.innerHTML = html;
-      const el = document.getElementById(\`src-\${currentLine}\`);
-      if (el) { el.scrollIntoView({ block: "center", behavior: "smooth" }); }
+      const focus = sourceEl.querySelector(".line-prev") || sourceEl.querySelector(".line-next");
+      if (focus) focus.scrollIntoView({ block: "center", behavior: "smooth" });
     }
 
+    // ── Arrow state — must be declared before renderStack uses it ─────────
+    let _ptrLinks = [];
+    const _memContainer = document.getElementById("pane-heap") || document.getElementById("pane-stack");
+
+    function drawArrows() {
+      const svg = document.getElementById("arrow-overlay");
+      if (!svg) return;
+      while (svg.children.length > 1) svg.removeChild(svg.lastChild);
+      // Use viewport-relative coords since SVG is position:fixed
+      for (const { fromId, toAddr } of _ptrLinks) {
+        const fromEl = document.getElementById(fromId);
+        const toEl   = document.getElementById(\`heap-\${toAddr}\`);
+        if (!fromEl || !toEl) continue;
+        const fr = fromEl.getBoundingClientRect();
+        const tr = toEl.getBoundingClientRect();
+        const x1 = fr.right;
+        const y1 = (fr.top + fr.bottom) / 2;
+        const x2 = tr.left;
+        const y2 = (tr.top  + tr.bottom) / 2;
+        const cp = Math.max(30, Math.abs(x2 - x1) * 0.45);
+        const d  = \`M\${x1},\${y1} C\${x1+cp},\${y1} \${x2-cp},\${y2} \${x2},\${y2}\`;
+        const p  = document.createElementNS("http://www.w3.org/2000/svg","path");
+        p.setAttribute("d", d); p.setAttribute("fill","none");
+        p.setAttribute("stroke","#7c6af7"); p.setAttribute("stroke-width","1.5");
+        p.setAttribute("stroke-opacity","0.85");
+        p.setAttribute("marker-end","url(#arrowhead)");
+        svg.appendChild(p);
+      }
+    }
+    window.addEventListener("resize", drawArrows);
+    window.addEventListener("scroll", drawArrows, true);
+
     function renderStack(frames) {
+      _ptrLinks = [];
       if (!frames.length) { stackEl.innerHTML = "<span style='color:var(--muted)'>No frames</span>"; return; }
       stackEl.innerHTML = frames.map(frame => {
         const localsHtml = (frame.locals || []).map(loc => {
-          const val = formatValue(loc.value);
-          return \`<div class="local-row">
-            <span class="local-name">\${esc(loc.name)}</span>
-            <span class="local-type">\${esc(loc.type)}</span>
-            <span class="local-value">\${val}</span>
+          const fromId   = \`ptr-\${esc(String(frame.depth))}-\${esc(loc.name)}\`;
+          const heapAddr = resolveHeapAddr(loc.value);
+          if (heapAddr) _ptrLinks.push({ fromId, toAddr: heapAddr });
+          const valHtml  = heapAddr
+            ? \`<span id="\${fromId}" style="display:inline-flex;align-items:center;line-height:1"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--accent)"></span></span>\`
+            : \`<div id="\${fromId}">\${renderValue(loc.value)}</div>\`;
+          return \`<div class="local-block">
+            <div class="local-header">
+              <span class="local-name">\${esc(loc.name)}</span>
+              <span class="local-type">\${esc(loc.type)}</span>
+            </div>
+            <div class="local-value-wrap">\${valHtml}</div>
           </div>\`;
         }).join("");
         return \`<div class="frame">
@@ -801,30 +926,128 @@ export class VisualizerPanel {
       }).join("");
     }
 
+    function resolveHeapAddr(v) {
+      if (!v || typeof v !== "object") return null;
+      if (v.kind === "pointer"  && v.address && v.value !== "NULL" && v.address !== "0x0") return v.address;
+      if (v.kind === "heap_ref" && v.address) return v.address;
+      if (!v.kind && v.address  && v.address !== "0x0" && v.value !== "NULL") return v.address;
+      return null;
+    }
+
     function renderHeap(blocks) {
       if (!blocks.length) { heapEl.innerHTML = "<span style='color:var(--muted)'>No heap allocations</span>"; return; }
       heapEl.innerHTML = blocks.map(block => {
+        const truncated = block.truncated ? \` <span style="color:var(--muted)">(truncated)</span>\` : "";
+        const header = \`<div class="heap-header"><span style="color:var(--muted)">\${block.size} bytes</span>\${truncated}</div>\`;
+        // If tracer resolved a typed value (struct, linked list etc), show that
+        if (block.typed_value) {
+          return \`<div class="heap-block" id="heap-\${esc(block.address)}">\${header}<div class="heap-typed">\${renderValue(block.typed_value)}</div></div>\`;
+        }
+        // Otherwise fall back to hex bytes
         const hexCells = (block.bytes || []).slice(0, 128).map(b => {
           const hex = b.toString(16).padStart(2, "0");
           return \`<span class="hex-cell\${b !== 0 ? " nonzero" : ""}">\${hex}</span>\`;
         }).join("");
-        return \`<div class="heap-block">
-          <div class="heap-header">\${esc(block.address)}  <span style="color:var(--muted)">\${block.size} bytes</span></div>
-          <div class="hex-grid">\${hexCells}</div>
-        </div>\`;
+        return \`<div class="heap-block" id="heap-\${esc(block.address)}">\${header}<div class="hex-grid">\${hexCells}</div></div>\`;
       }).join("");
     }
 
-    // ── Value formatter ───────────────────────────────────────────────────
+    // ── Rich value renderer ────────────────────────────────────────────────
+    // Renders the new tracer format (objects with a "kind" field).
+    // Falls back gracefully for old-format values.
 
-    function formatValue(v) {
-      if (v === null || v === undefined) return "<span style='color:var(--muted)'>—</span>";
-      if (typeof v !== "object") return esc(String(v));
-      if (v.value === "NULL")    return "<span style='color:var(--error)'>NULL</span>";
-      if (v.string_value != null) return esc(\`"\${v.string_value}"\`);
-      if (Array.isArray(v.value)) return \`[\${v.value.length} elements]\`;
-      if (v.value !== null && typeof v.value === "object") return \`{ … }\`;
-      return esc(String(v.value ?? "?"));
+    function renderValue(v) {
+      if (v === null || v === undefined) return \`<span class="val-null">—</span>\`;
+      // Old format fallback (plain string/number)
+      if (typeof v !== "object") return \`<span class="val-prim">\${esc(String(v))}</span>\`;
+
+      switch (v.kind) {
+        case "primitive": {
+          if (v.uninit) return \`<span class="val-uninit" title="Uninitialized / garbage">?</span>\`;
+          if (v.value === "NULL") return \`<span class="val-null">NULL</span>\`;
+          return \`<span class="val-prim">\${esc(String(v.value))}</span>\`;
+        }
+        case "string":
+          return \`<span class="val-string">\${esc(v.value)}</span>\`;
+        case "pointer":
+          if (v.value === "NULL") return \`<span class="val-null">NULL</span>\`;
+          if (v.points_to)        return \`<span class="val-ptr">→</span> \${renderValue(v.points_to)}\`;
+          return \`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--accent);vertical-align:middle"></span>\`;
+        case "array":
+          return renderArray(v);
+        case "struct":
+          return renderStruct(v);
+        case "linked_list":
+          return renderLinkedList(v);
+        case "heap_ref": {
+          const a = esc(v.address || "?");
+          return \`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--accent);vertical-align:middle;cursor:pointer"
+            onclick="(function(){var el=document.getElementById('heap-\${a}');if(el){el.scrollIntoView({behavior:'smooth',block:'nearest'});el.animate([{outline:'2px solid var(--accent)'},{outline:'2px solid transparent'}],{duration:800});}})()"
+            title="Click to jump to heap block"></span>\`;
+        }
+        case "truncated":
+          return \`<span class="val-muted">&lt;max depth&gt;</span>\`;
+        case "error":
+          return \`<span class="val-muted">&lt;\${esc(v.value)}&gt;</span>\`;
+        case "cycle":
+          return \`<span class="val-muted">↩ cycle</span>\`;
+        default:
+          // Old format: {value, points_to} objects
+          if (v.value === "NULL")  return \`<span class="val-null">NULL</span>\`;
+          if (v.points_to != null) return \`<span class="val-ptr">→</span> \${renderValue(v.points_to)}\`;
+          if (Array.isArray(v.value)) return renderArray({ kind:"array", elements: v.value, length: v.value.length });
+          return \`<span class="val-prim">\${esc(String(v.value ?? "?"))}</span>\`;
+      }
+    }
+
+    function renderArray(v) {
+      const els = v.elements || v.value || [];
+      const cells = els.map((el, i) => {
+        const isUninit = el && el.uninit;
+        const cellVal  = isUninit
+          ? \`<span class="val-uninit" title="Uninitialized">?</span>\`
+          : renderValue(el);
+        return \`<div class="arr-cell">
+          <div class="arr-idx">\${i}</div>
+          <div class="arr-val">\${cellVal}</div>
+        </div>\`;
+      }).join("");
+      return \`<div class="arr-wrap">\${cells}</div>\`;
+    }
+
+    function renderStruct(v) {
+      const fields = v.fields || {};
+      const rows = Object.entries(fields).map(([name, val]) =>
+        \`<div class="struct-row">
+          <span class="struct-field">\${esc(name)}</span>
+          <span class="struct-val">\${renderValue(val)}</span>
+        </div>\`
+      ).join("");
+      return \`<div class="struct-wrap">\${rows || "<span class='val-muted'>empty</span>"}</div>\`;
+    }
+
+    function renderLinkedList(v) {
+      const nodes = v.nodes || [];
+      if (!nodes.length) return \`<span class="val-null">NULL</span>\`;
+      const nodeHtml = nodes.map((node, i) => {
+        if (node.kind === "cycle") return \`<span class="val-muted">↩ cycle</span>\`;
+        if (node.kind === "error") return \`<span class="val-muted">error: \${esc(node.value)}</span>\`;
+        const fields = node.fields || {};
+        const rows = Object.entries(fields).map(([name, fval]) => {
+          // Skip the next-pointer field in the node box (it's shown as the arrow)
+          const isNextPtr = fval && fval.kind === "pointer" && (fval.value === "->" || fval.value === "NULL");
+          if (isNextPtr) return "";
+          return \`<div class="ll-field"><span class="struct-field">\${esc(name)}</span> <span class="struct-val">\${renderValue(fval)}</span></div>\`;
+        }).join("");
+        const arrow = i < nodes.length - 1 ? \`<span class="ll-arrow">→</span>\` : "";
+        return \`<div class="ll-node">\${rows || "<span class='val-muted'>·</span>"}</div>\${arrow}\`;
+      }).join("");
+      // Check if last node has a null next ptr — show terminator
+      const last = nodes[nodes.length - 1];
+      const hasNull = last && last.fields && Object.values(last.fields).some(
+        f => f && f.kind === "pointer" && f.value === "NULL"
+      );
+      return \`<div class="ll-wrap">\${nodeHtml}\${hasNull ? \`<span class="ll-arrow">→</span><span class="val-null">NULL</span>\` : ""}</div>\`;
     }
 
     // ── Utility ───────────────────────────────────────────────────────────
@@ -846,8 +1069,7 @@ export class VisualizerPanel {
   })();
   </script>
 
-  <!-- If media/webview.js exists it can override the fallback UI above -->
-  <script nonce="${nonce}" src="${scriptUri}"></script>
+  ${webviewJsTag}
 </body>
 </html>`;
   }

@@ -205,25 +205,21 @@ int main() {
 
 ## Output Files
 
-When you run the visualizer, two files are written to your Desktop:
+When you run the visualizer, two files are written to the extension's global storage directory:
 
 | File | Description |
 |------|-------------|
 | `cvis_program.exe` | Compiled binary of your `.c` file |
 | `cvis_trace.json` | Full execution trace used by the visualizer |
 
-These are overwritten on every run. If you get a "Permission Denied" error, delete them manually from the Desktop and try again.
+These are overwritten on every run. The exact storage location is shown in the **C Visualizer** output panel.
 
 ---
 
 ## Troubleshooting
 
 ### "Compilation failed: Permission Denied"
-The previous `cvis_program.exe` is still locked by Windows.  
-Fix: delete it from the Desktop before running again.
-```powershell
-Remove-Item C:\Users\<you>\Desktop\cvis_program.exe -Force
-```
+The previous `cvis_program.exe` is still locked by Windows. Restart the visualizer after the process exits, then check the **C Visualizer** output panel for the storage path.
 
 ### "GDB did not produce trace.json"
 Open the **C Visualizer** output panel (View → Output → select "C Visualizer") to see the full GDB log.  
