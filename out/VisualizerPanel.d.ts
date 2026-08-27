@@ -16,6 +16,7 @@ export declare class VisualizerPanel {
     private _disposables;
     private _isRunning;
     private _traceLoaded;
+    private _webviewReady;
     private _lastTrace;
     static createOrShow(context: vscode.ExtensionContext, fileUri: vscode.Uri): Promise<void>;
     static rerun(context: vscode.ExtensionContext): Promise<void>;

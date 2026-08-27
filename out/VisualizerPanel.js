@@ -67,6 +67,7 @@ class VisualizerPanel {
     _disposables = [];
     _isRunning = false;
     _traceLoaded = false;
+    _webviewReady = false;
     _lastTrace;
     // ── Factory ──────────────────────────────────────────────────────────────
     static async createOrShow(context, fileUri) {
@@ -215,12 +216,14 @@ class VisualizerPanel {
             // Cache the trace so READY can replay it without re-running GDB.
             this._lastTrace = { data: traceData, source: sourceText, filename: path.basename(filePath) };
             this._traceLoaded = true;
-            this._postMessage({
-                command: "LOAD_TRACE",
-                data: traceData,
-                source: sourceText,
-                filename: path.basename(filePath),
-            });
+            if (this._webviewReady) {
+                this._postMessage({
+                    command: "LOAD_TRACE",
+                    data: traceData,
+                    source: sourceText,
+                    filename: path.basename(filePath),
+                });
+            }
         }
         finally {
             this._isRunning = false;
@@ -334,6 +337,7 @@ class VisualizerPanel {
     _handleWebviewMessage(msg) {
         switch (msg.command) {
             case "READY":
+                this._webviewReady = true;
                 if (this._traceLoaded && this._lastTrace) {
                     // Webview just (re)loaded — push the cached trace, no GDB rerun needed.
                     this._postMessage({
@@ -547,6 +551,18 @@ class VisualizerPanel {
     .val-ptr    { font-family: var(--mono); font-size: 11px; color: var(--accent); }
     .val-muted  { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 
+    /* Heap reference badge — replaces inline node data for heap pointers in locals */
+    .val-heap-ref {
+      font-family: var(--mono); font-size: 10px;
+      color: var(--accent);
+      background: rgba(124,106,247,0.15);
+      border: 1px solid rgba(124,106,247,0.45);
+      border-radius: 3px; padding: 1px 6px;
+      cursor: pointer; user-select: none;
+    }
+    .val-heap-ref::before { content: "heap "; color: var(--muted); font-size: 9px; }
+    .val-heap-ref:hover { background: rgba(124,106,247,0.3); }
+
     /* Struct rendering */
     .struct-wrap { display: flex; flex-direction: column; gap: 2px; border-left: 2px solid var(--border); padding-left: 8px; }
     .struct-row  { display: flex; gap: 6px; font-family: var(--mono); font-size: 11px; }
@@ -601,6 +617,10 @@ class VisualizerPanel {
     .source-line { display: flex; font-family: monospace; font-size: 12px; line-height: 1.6; padding: 0 8px; }
     .source-line:hover { background: rgba(255,255,255,0.05); }
     .active-line { background: rgba(255,215,0,0.18) !important; border-left: 3px solid #ffd700; }
+    /* PT-style dual highlights */
+    .line-prev { background: rgba(144,238,144,0.12) !important; border-left: 3px solid #4caf50; }
+    .line-next { background: rgba(255,80,80,0.15)   !important; border-left: 3px solid #f44336; }
+    .line-arrow { width: 14px; flex-shrink: 0; font-size: 9px; display: flex; align-items: center; }
     .line-num { color: var(--muted); min-width: 36px; user-select: none; text-align: right; padding-right: 12px; }
     .line-text { white-space: pre; flex: 1; }
   </style>
@@ -620,6 +640,16 @@ class VisualizerPanel {
   </div>
 
   <div id="error-banner" role="alert"></div>
+
+  <!-- Fixed SVG arrow overlay — sits above everything, pointer-events:none -->
+  <svg id="arrow-overlay" xmlns="http://www.w3.org/2000/svg"
+       style="position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:999;overflow:visible">
+    <defs>
+      <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#7c6af7" opacity="0.85"/>
+      </marker>
+    </defs>
+  </svg>
 
   <div id="main">
     <div class="pane" id="pane-source">
@@ -723,49 +753,94 @@ class VisualizerPanel {
 
     function renderStep(n) {
       if (!trace || !trace.timeline[n]) return;
-      const step = trace.timeline[n];
-      const total = trace.timeline.length;
+      const step     = trace.timeline[n];
+      const nextStep = trace.timeline[n + 1];
+      const total    = trace.timeline.length;
 
       stepLabel.textContent = \`Step \${n + 1} / \${total}  ·  \${step.event || ""}\`;
-
       if (step.file) {
         const short = step.file.split("/").pop();
         setStatus(\`\${short}:\${step.line}  (step \${n + 1}/\${total})\`);
       }
 
-      renderSource(step.line || 0);
+      const justLine = step.line || 0;
+      const nextLine = nextStep ? (nextStep.line || 0) : 0;
+      renderSource(justLine, nextLine);
       renderStack(step.stack || []);
       renderHeap(step.heap  || []);
+      requestAnimationFrame(drawArrows);
     }
 
-    function renderSource(currentLine) {
+    function renderSource(justLine, nextLine) {
       if (!sourceLines.length) {
         sourceEl.innerHTML = "<span style='color:var(--muted)'>No source available.</span>";
         return;
       }
-      const html = sourceLines.map((line, i) => {
-        const lineNum = i + 1;
-        const isActive = lineNum === currentLine;
-        return \`<div class="source-line\${isActive ? " active-line" : ""}" id="src-\${lineNum}">\` +
-               \`<span class="line-num">\${lineNum}</span>\` +
-               \`<span class="line-text">\${esc(line) || " "}</span>\` +
-               \`</div>\`;
+      sourceEl.innerHTML = sourceLines.map((line, i) => {
+        const ln     = i + 1;
+        const isJust = ln === justLine;
+        const isNext = ln === nextLine && nextLine !== justLine;
+        const cls    = isJust ? " line-prev" : isNext ? " line-next" : "";
+        const arrow  = isJust
+          ? \`<span class="line-arrow" style="color:#4caf50">▶</span>\`
+          : isNext
+            ? \`<span class="line-arrow" style="color:#f44336">▶</span>\`
+            : \`<span class="line-arrow"></span>\`;
+        return \`<div class="source-line\${cls}">\${arrow}<span class="line-num">\${ln}</span><span class="line-text">\${esc(line) || " "}</span></div>\`;
       }).join("");
-      sourceEl.innerHTML = html;
-      const el = document.getElementById(\`src-\${currentLine}\`);
-      if (el) { el.scrollIntoView({ block: "center", behavior: "smooth" }); }
+      const focus = sourceEl.querySelector(".line-prev") || sourceEl.querySelector(".line-next");
+      if (focus) focus.scrollIntoView({ block: "center", behavior: "smooth" });
     }
 
+    // ── Arrow state — must be declared before renderStack uses it ─────────
+    let _ptrLinks = [];
+    const _memContainer = document.getElementById("pane-heap") || document.getElementById("pane-stack");
+
+    function drawArrows() {
+      const svg = document.getElementById("arrow-overlay");
+      if (!svg) return;
+      while (svg.children.length > 1) svg.removeChild(svg.lastChild);
+      // Use viewport-relative coords since SVG is position:fixed
+      for (const { fromId, toAddr } of _ptrLinks) {
+        const fromEl = document.getElementById(fromId);
+        const toEl   = document.getElementById(\`heap-\${toAddr}\`);
+        if (!fromEl || !toEl) continue;
+        const fr = fromEl.getBoundingClientRect();
+        const tr = toEl.getBoundingClientRect();
+        const x1 = fr.right;
+        const y1 = (fr.top + fr.bottom) / 2;
+        const x2 = tr.left;
+        const y2 = (tr.top  + tr.bottom) / 2;
+        const cp = Math.max(30, Math.abs(x2 - x1) * 0.45);
+        const d  = \`M\${x1},\${y1} C\${x1+cp},\${y1} \${x2-cp},\${y2} \${x2},\${y2}\`;
+        const p  = document.createElementNS("http://www.w3.org/2000/svg","path");
+        p.setAttribute("d", d); p.setAttribute("fill","none");
+        p.setAttribute("stroke","#7c6af7"); p.setAttribute("stroke-width","1.5");
+        p.setAttribute("stroke-opacity","0.85");
+        p.setAttribute("marker-end","url(#arrowhead)");
+        svg.appendChild(p);
+      }
+    }
+    window.addEventListener("resize", drawArrows);
+    window.addEventListener("scroll", drawArrows, true);
+
     function renderStack(frames) {
+      _ptrLinks = [];
       if (!frames.length) { stackEl.innerHTML = "<span style='color:var(--muted)'>No frames</span>"; return; }
       stackEl.innerHTML = frames.map(frame => {
         const localsHtml = (frame.locals || []).map(loc => {
+          const fromId   = \`ptr-\${esc(String(frame.depth))}-\${esc(loc.name)}\`;
+          const heapAddr = resolveHeapAddr(loc.value);
+          if (heapAddr) _ptrLinks.push({ fromId, toAddr: heapAddr });
+          const valHtml  = heapAddr
+            ? \`<span id="\${fromId}" style="display:inline-flex;align-items:center;line-height:1"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--accent)"></span></span>\`
+            : \`<div id="\${fromId}">\${renderValue(loc.value)}</div>\`;
           return \`<div class="local-block">
             <div class="local-header">
               <span class="local-name">\${esc(loc.name)}</span>
               <span class="local-type">\${esc(loc.type)}</span>
             </div>
-            <div class="local-value-wrap">\${renderValue(loc.value)}</div>
+            <div class="local-value-wrap">\${valHtml}</div>
           </div>\`;
         }).join("");
         return \`<div class="frame">
@@ -775,21 +850,29 @@ class VisualizerPanel {
       }).join("");
     }
 
+    function resolveHeapAddr(v) {
+      if (!v || typeof v !== "object") return null;
+      if (v.kind === "pointer"  && v.address && v.value !== "NULL" && v.address !== "0x0") return v.address;
+      if (v.kind === "heap_ref" && v.address) return v.address;
+      if (!v.kind && v.address  && v.address !== "0x0" && v.value !== "NULL") return v.address;
+      return null;
+    }
+
     function renderHeap(blocks) {
       if (!blocks.length) { heapEl.innerHTML = "<span style='color:var(--muted)'>No heap allocations</span>"; return; }
       heapEl.innerHTML = blocks.map(block => {
         const truncated = block.truncated ? \` <span style="color:var(--muted)">(truncated)</span>\` : "";
-        const header = \`<div class="heap-header">\${esc(block.address)} <span style="color:var(--muted)">\${block.size} bytes</span>\${truncated}</div>\`;
+        const header = \`<div class="heap-header"><span style="color:var(--muted)">\${block.size} bytes</span>\${truncated}</div>\`;
         // If tracer resolved a typed value (struct, linked list etc), show that
         if (block.typed_value) {
-          return \`<div class="heap-block">\${header}<div class="heap-typed">\${renderValue(block.typed_value)}</div></div>\`;
+          return \`<div class="heap-block" id="heap-\${esc(block.address)}">\${header}<div class="heap-typed">\${renderValue(block.typed_value)}</div></div>\`;
         }
         // Otherwise fall back to hex bytes
         const hexCells = (block.bytes || []).slice(0, 128).map(b => {
           const hex = b.toString(16).padStart(2, "0");
           return \`<span class="hex-cell\${b !== 0 ? " nonzero" : ""}">\${hex}</span>\`;
         }).join("");
-        return \`<div class="heap-block">\${header}<div class="hex-grid">\${hexCells}</div></div>\`;
+        return \`<div class="heap-block" id="heap-\${esc(block.address)}">\${header}<div class="hex-grid">\${hexCells}</div></div>\`;
       }).join("");
     }
 
@@ -813,19 +896,25 @@ class VisualizerPanel {
         case "pointer":
           if (v.value === "NULL") return \`<span class="val-null">NULL</span>\`;
           if (v.points_to)        return \`<span class="val-ptr">→</span> \${renderValue(v.points_to)}\`;
-          return \`<span class="val-ptr">\${esc(v.address || "?")}</span>\`;
+          return \`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--accent);vertical-align:middle"></span>\`;
         case "array":
           return renderArray(v);
         case "struct":
           return renderStruct(v);
         case "linked_list":
           return renderLinkedList(v);
+        case "heap_ref": {
+          const a = esc(v.address || "?");
+          return \`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--accent);vertical-align:middle;cursor:pointer"
+            onclick="(function(){var el=document.getElementById('heap-\${a}');if(el){el.scrollIntoView({behavior:'smooth',block:'nearest'});el.animate([{outline:'2px solid var(--accent)'},{outline:'2px solid transparent'}],{duration:800});}})()"
+            title="Click to jump to heap block"></span>\`;
+        }
         case "truncated":
           return \`<span class="val-muted">&lt;max depth&gt;</span>\`;
         case "error":
           return \`<span class="val-muted">&lt;\${esc(v.value)}&gt;</span>\`;
         case "cycle":
-          return \`<span class="val-muted">↩ cycle @ \${esc(v.address)}</span>\`;
+          return \`<span class="val-muted">↩ cycle</span>\`;
         default:
           // Old format: {value, points_to} objects
           if (v.value === "NULL")  return \`<span class="val-null">NULL</span>\`;

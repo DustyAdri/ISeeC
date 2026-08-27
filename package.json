@@ -5,15 +5,27 @@
   "version": "0.1.0",
   "publisher": "DustyAdri",
   "license": "MIT",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Debuggers", "Education", "Visualization"],
-  "keywords": ["C", "GDB", "debugger", "visualizer", "PythonTutor"],
-  "repository": { "type": "git", "url": "https://github.com/DustyAdri/ISeeC" },
-
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Education",
+    "Visualization"
+  ],
+  "keywords": [
+    "C",
+    "GDB",
+    "debugger",
+    "visualizer",
+    "PythonTutor"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DustyAdri/ISeeC"
+  },
   "activationEvents": [],
-
   "main": "./out/extension.js",
-
   "contributes": {
     "commands": [
       {
@@ -29,7 +41,6 @@
         "icon": "$(refresh)"
       }
     ],
-
     "menus": {
       "editor/context": [
         {
@@ -55,7 +66,6 @@
         }
       ]
     },
-
     "keybindings": [
       {
         "command": "cVisualizer.start",
@@ -64,7 +74,6 @@
         "when": "resourceLangId == c"
       }
     ],
-
     "configuration": {
       "title": "C Execution Visualizer",
       "properties": {
@@ -91,7 +100,6 @@
       }
     }
   },
-
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
@@ -99,7 +107,6 @@
     "lint": "eslint src --ext ts",
     "package": "vsce package"
   },
-
   "devDependencies": {
     "@types/node": "^20.11.5",
     "@types/vscode": "^1.85.0",
@@ -107,6 +114,6 @@
     "@typescript-eslint/parser": "^6.19.1",
     "@vscode/vsce": "^2.23.0",
     "eslint": "^8.56.0",
-    "typescript": "^5.3.3"
+    "typescript": "^5.9.3"
   }
 }
