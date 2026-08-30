@@ -468,8 +468,8 @@ class VisualizerPanel {
     #step-label { font-family: var(--mono); font-size: 11px; color: var(--muted); min-width: 80px; }
     #main {
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      grid-template-rows: 1fr 1fr;
+      grid-template-columns: 1fr 2fr;
+      grid-template-rows: 1fr;
       gap: 1px;
       background: var(--border);
       flex: 1;
@@ -488,7 +488,7 @@ class VisualizerPanel {
       color: var(--muted);
       margin-bottom: 8px;
     }
-    #pane-source { grid-column: 1; grid-row: 1 / 3; }
+    #pane-source { grid-column: 1; grid-row: 1; }
     pre#source-code {
       font-family: var(--mono);
       font-size: 12px;
@@ -496,7 +496,6 @@ class VisualizerPanel {
       white-space: pre;
       counter-reset: lines;
     }
-    #pane-stack { grid-column: 2; grid-row: 1; }
     .frame { margin-bottom: 10px; }
     .frame-header {
       font-family: var(--mono);
@@ -582,24 +581,32 @@ class VisualizerPanel {
 
     /* Heap typed value */
     .heap-typed { padding: 4px 0; }
-    #pane-heap { grid-column: 2; grid-row: 2; }
-    .heap-block { margin-bottom: 10px; }
-    .heap-header { font-family: var(--mono); font-size: 11px; color: var(--accent); margin-bottom: 4px; }
-    .hex-grid {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 2px;
-      font-family: var(--mono);
-      font-size: 10px;
-    }
-    .hex-cell {
-      width: 22px;
-      text-align: center;
-      padding: 1px 0;
-      border-radius: 2px;
+    .heap-block {
+      margin-bottom: 12px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      overflow: hidden;
       background: var(--surface);
-      color: var(--text);
     }
+    .heap-header { font-family: var(--mono); font-size: 11px; color: var(--accent); margin-bottom: 4px; }
+    /* Heap block type label */
+    .hb-type {
+      font-family: var(--mono); font-size: 10px; font-weight: 700;
+      color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em;
+      padding: 4px 8px; border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,0.03);
+    }
+    /* Field rows inside a heap struct block */
+    .hb-fields { display: flex; flex-direction: column; }
+    .hb-row {
+      display: flex; align-items: center;
+      padding: 4px 8px; gap: 10px;
+      border-bottom: 1px solid var(--border);
+      font-family: var(--mono); font-size: 11px;
+    }
+    .hb-row:last-child { border-bottom: none; }
+    .hb-field { color: var(--muted); min-width: 60px; flex-shrink: 0; }
+    .hb-val   { color: var(--success); }
     .hex-cell.nonzero { background: rgba(124,106,247,0.25); color: var(--accent); }
     #error-banner {
       display: none;
@@ -623,6 +630,46 @@ class VisualizerPanel {
     .line-arrow { width: 14px; flex-shrink: 0; font-size: 9px; display: flex; align-items: center; }
     .line-num { color: var(--muted); min-width: 36px; user-select: none; text-align: right; padding-right: 12px; }
     .line-text { white-space: pre; flex: 1; }
+
+    #output-box {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 6px 8px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      min-height: 52px;
+      max-height: 120px;
+      overflow-y: auto;
+      flex-shrink: 0;
+      margin-bottom: 8px;
+    }
+    #output-box:empty::before {
+      content: "(no output yet)";
+      color: var(--muted);
+    }
+    /* Stack+heap sub-layout inside the right two columns */
+    #right-panes {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: auto 1fr;
+      gap: 1px;
+      background: var(--border);
+      overflow: hidden;
+    }
+    #print-output-pane {
+      grid-column: 1 / 3;
+      grid-row: 1;
+      background: var(--bg);
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    #pane-stack-inner { grid-column: 1; grid-row: 2; background: var(--bg); overflow: auto; padding: 10px 12px; }
+    #pane-heap-inner  { grid-column: 2; grid-row: 2; background: var(--bg); overflow: auto; padding: 10px 12px; }
   </style>
 </head>
 <body>
@@ -652,17 +699,31 @@ class VisualizerPanel {
   </svg>
 
   <div id="main">
+    <!-- Left column: source code -->
     <div class="pane" id="pane-source">
       <div class="pane-title">Source</div>
       <pre id="source-code"><span style="color:var(--muted)">Waiting for trace…</span></pre>
     </div>
-    <div class="pane" id="pane-stack">
-      <div class="pane-title">Call Stack &amp; Locals</div>
-      <div id="stack-content"></div>
-    </div>
-    <div class="pane" id="pane-heap">
-      <div class="pane-title">Heap Allocations</div>
-      <div id="heap-content"></div>
+
+    <!-- Right two columns: print output on top, then stack | heap below -->
+    <div id="right-panes">
+      <!-- Print output — spans both right columns -->
+      <div id="print-output-pane">
+        <div class="pane-title">Print Output</div>
+        <div id="output-box"></div>
+      </div>
+
+      <!-- Stack (middle column) -->
+      <div id="pane-stack-inner">
+        <div class="pane-title">Call Stack &amp; Locals</div>
+        <div id="stack-content"></div>
+      </div>
+
+      <!-- Heap (right column) -->
+      <div id="pane-heap-inner">
+        <div class="pane-title">Heap Allocations</div>
+        <div id="heap-content"></div>
+      </div>
     </div>
   </div>
 
@@ -686,6 +747,7 @@ class VisualizerPanel {
     const sourceEl  = document.getElementById("source-code");
     const stackEl   = document.getElementById("stack-content");
     const heapEl    = document.getElementById("heap-content");
+    const outputEl  = document.getElementById("output-box");
     const errBanner = document.getElementById("error-banner");
     const btnRerun  = document.getElementById("btn-rerun");
     const btnPrev   = document.getElementById("btn-prev");
@@ -768,6 +830,10 @@ class VisualizerPanel {
       renderSource(justLine, nextLine);
       renderStack(step.stack || []);
       renderHeap(step.heap  || []);
+      // Use nullish coalescing so an empty string "" (no output yet at this
+      // step) is passed through as-is rather than falling back to a stale
+      // top-level trace.stdout that doesn't exist in the JSON schema.
+      renderOutput(step.stdout ?? trace.stdout ?? "");
       requestAnimationFrame(drawArrows);
     }
 
@@ -792,9 +858,23 @@ class VisualizerPanel {
       if (focus) focus.scrollIntoView({ block: "center", behavior: "smooth" });
     }
 
+    function renderOutput(text) {
+      if (!outputEl) return;
+      // Use explicit null/undefined check — an empty string "" is valid
+      // (program printed nothing yet) and should not fall through to a
+      // stale fallback.  Only skip rendering when the value is genuinely absent.
+      if (text == null) {
+        outputEl.textContent = "";
+        return;
+      }
+      outputEl.textContent = text;
+      // Auto-scroll to bottom so latest output is visible
+      outputEl.scrollTop = outputEl.scrollHeight;
+    }
+
     // ── Arrow state — must be declared before renderStack uses it ─────────
     let _ptrLinks = [];
-    const _memContainer = document.getElementById("pane-heap") || document.getElementById("pane-stack");
+    const _memContainer = document.getElementById("pane-heap-inner") || document.getElementById("pane-stack-inner");
 
     function drawArrows() {
       const svg = document.getElementById("arrow-overlay");
@@ -859,26 +939,58 @@ class VisualizerPanel {
     }
 
     function renderHeap(blocks) {
-      if (!blocks.length) { heapEl.innerHTML = "<span style='color:var(--muted)'>No heap allocations</span>"; return; }
-      heapEl.innerHTML = blocks.map(block => {
-        const truncated = block.truncated ? \` <span style="color:var(--muted)">(truncated)</span>\` : "";
-        const header = \`<div class="heap-header"><span style="color:var(--muted)">\${block.size} bytes</span>\${truncated}</div>\`;
-        // If tracer resolved a typed value (struct, linked list etc), show that
-        if (block.typed_value) {
-          return \`<div class="heap-block" id="heap-\${esc(block.address)}">\${header}<div class="heap-typed">\${renderValue(block.typed_value)}</div></div>\`;
-        }
-        // Otherwise fall back to hex bytes
-        const hexCells = (block.bytes || []).slice(0, 128).map(b => {
-          const hex = b.toString(16).padStart(2, "0");
-          return \`<span class="hex-cell\${b !== 0 ? " nonzero" : ""}">\${hex}</span>\`;
-        }).join("");
-        return \`<div class="heap-block" id="heap-\${esc(block.address)}">\${header}<div class="hex-grid">\${hexCells}</div></div>\`;
-      }).join("");
+      // Only show blocks that have a typed value (a resolved struct/value from malloc).
+      // Hex bytes, phantom blocks, and unresolved allocations are hidden — they're
+      // noise. The heap panel should only show what the user explicitly malloc'd.
+      const rendered = blocks.map(block => {
+        if (!block.typed_value) return "";   // unresolved — skip
+        const html = renderTypedHeapBlock(block.typed_value);
+        if (!html) return "";                // noise — skip
+        return \`<div class="heap-block" id="heap-\${esc(block.address)}">\${html}</div>\`;
+      }).filter(Boolean).join("");
+
+      heapEl.innerHTML = rendered ||
+        "<span style='color:var(--muted);font-size:11px'>No heap allocations yet</span>";
+    }
+
+    // Render the contents of a heap block as a clean struct/value card.
+    // Returns empty string for blocks that are just noise.
+    function renderTypedHeapBlock(tv) {
+      if (!tv || typeof tv !== "object") return "";
+
+      // Struct: render as a labelled table of field → value rows (Python Tutor style)
+      if (tv.kind === "struct") {
+        const fields = tv.fields || {};
+        const rows = Object.entries(fields).map(([name, val]) => {
+          if (val && val.kind === "error" && isMemoryNoise(val.value)) return "";
+          const valHtml = renderValue(val);
+          if (!valHtml) return "";
+          return \`<div class="hb-row">
+            <span class="hb-field">\${esc(name)}</span>
+            <span class="hb-val">\${valHtml}</span>
+          </div>\`;
+        }).filter(Boolean).join("");
+        if (!rows) return "";
+        const label = tv.type ? \`<div class="hb-type">\${esc(tv.type)}</div>\` : "";
+        return \`\${label}<div class="hb-fields">\${rows}</div>\`;
+      }
+
+      // Primitive / pointer / other — just render the value
+      const html = renderValue(tv);
+      if (!html || html === \`<span class="val-muted">?</span>\`) return "";
+      return \`<div class="hb-row"><span class="hb-val">\${html}</span></div>\`;
     }
 
     // ── Rich value renderer ────────────────────────────────────────────────
     // Renders the new tracer format (objects with a "kind" field).
     // Falls back gracefully for old-format values.
+
+    // Returns true if a string looks like a raw memory error / address noise
+    // that we want to hide from the user ("Cannot access memory at 0x...", etc.)
+    function isMemoryNoise(s) {
+      if (typeof s !== "string") return false;
+      return /cannot access memory/i.test(s) || /^0x[0-9a-f]+$/i.test(s.trim());
+    }
 
     function renderValue(v) {
       if (v === null || v === undefined) return \`<span class="val-null">—</span>\`;
@@ -895,8 +1007,9 @@ class VisualizerPanel {
           return \`<span class="val-string">\${esc(v.value)}</span>\`;
         case "pointer":
           if (v.value === "NULL") return \`<span class="val-null">NULL</span>\`;
+          // Pointer dot — clicking scrolls to the target heap block if one exists
           if (v.points_to)        return \`<span class="val-ptr">→</span> \${renderValue(v.points_to)}\`;
-          return \`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--accent);vertical-align:middle"></span>\`;
+          return \`<span class="ptr-dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--accent);vertical-align:middle"></span>\`;
         case "array":
           return renderArray(v);
         case "struct":
@@ -904,15 +1017,19 @@ class VisualizerPanel {
         case "linked_list":
           return renderLinkedList(v);
         case "heap_ref": {
-          const a = esc(v.address || "?");
-          return \`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--accent);vertical-align:middle;cursor:pointer"
+          // Show as a clickable dot that jumps to the heap block — no address text
+          const a = esc(v.address || "");
+          return \`<span class="ptr-dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--accent);vertical-align:middle;cursor:pointer"
             onclick="(function(){var el=document.getElementById('heap-\${a}');if(el){el.scrollIntoView({behavior:'smooth',block:'nearest'});el.animate([{outline:'2px solid var(--accent)'},{outline:'2px solid transparent'}],{duration:800});}})()"
-            title="Click to jump to heap block"></span>\`;
+            title="Points to heap allocation"></span>\`;
         }
         case "truncated":
-          return \`<span class="val-muted">&lt;max depth&gt;</span>\`;
-        case "error":
+          return \`<span class="val-muted">(…)</span>\`;
+        case "error": {
+          // Suppress raw "Cannot access memory at 0x..." noise entirely
+          if (isMemoryNoise(v.value)) return \`<span class="val-muted">?</span>\`;
           return \`<span class="val-muted">&lt;\${esc(v.value)}&gt;</span>\`;
+        }
         case "cycle":
           return \`<span class="val-muted">↩ cycle</span>\`;
         default:
@@ -941,12 +1058,14 @@ class VisualizerPanel {
 
     function renderStruct(v) {
       const fields = v.fields || {};
-      const rows = Object.entries(fields).map(([name, val]) =>
-        \`<div class="struct-row">
+      const rows = Object.entries(fields).map(([name, val]) => {
+        // Skip fields that are pure memory noise
+        if (val && val.kind === "error" && isMemoryNoise(val.value)) return "";
+        return \`<div class="struct-row">
           <span class="struct-field">\${esc(name)}</span>
           <span class="struct-val">\${renderValue(val)}</span>
-        </div>\`
-      ).join("");
+        </div>\`;
+      }).join("");
       return \`<div class="struct-wrap">\${rows || "<span class='val-muted'>empty</span>"}</div>\`;
     }
 
@@ -955,12 +1074,17 @@ class VisualizerPanel {
       if (!nodes.length) return \`<span class="val-null">NULL</span>\`;
       const nodeHtml = nodes.map((node, i) => {
         if (node.kind === "cycle") return \`<span class="val-muted">↩ cycle</span>\`;
-        if (node.kind === "error") return \`<span class="val-muted">error: \${esc(node.value)}</span>\`;
+        if (node.kind === "error") {
+          if (isMemoryNoise(node.value)) return "";
+          return \`<span class="val-muted">error: \${esc(node.value)}</span>\`;
+        }
         const fields = node.fields || {};
         const rows = Object.entries(fields).map(([name, fval]) => {
-          // Skip the next-pointer field in the node box (it's shown as the arrow)
+          // Skip the next-pointer field (shown as the arrow between nodes)
           const isNextPtr = fval && fval.kind === "pointer" && (fval.value === "->" || fval.value === "NULL");
           if (isNextPtr) return "";
+          // Skip memory noise fields
+          if (fval && fval.kind === "error" && isMemoryNoise(fval.value)) return "";
           return \`<div class="ll-field"><span class="struct-field">\${esc(name)}</span> <span class="struct-val">\${renderValue(fval)}</span></div>\`;
         }).join("");
         const arrow = i < nodes.length - 1 ? \`<span class="ll-arrow">→</span>\` : "";
