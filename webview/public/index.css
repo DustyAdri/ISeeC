@@ -151,6 +151,25 @@ body {
   color: var(--text-muted);
 }
 
+.ctrl-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.ctrl-toggle:hover {
+  color: var(--text-primary);
+}
+
+.ctrl-toggle input[type="checkbox"] {
+  accent-color: var(--frame-active-border);
+  cursor: pointer;
+}
+
 /* ---- Error banner ---- */
 .error-banner {
   background: rgba(239, 83, 80, 0.15);
@@ -167,6 +186,26 @@ body {
   flex: 1;
   overflow: hidden;
   position: relative; /* arrow layer is positioned relative to this */
+}
+
+/* ---- Program output ---- */
+.program-output {
+  flex-shrink: 0;
+  max-height: 160px;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-md);
+  background: #0A0E14;
+  border-top: 1px solid #21262D;
+  overflow-y: auto;
+}
+
+.program-output__text {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* ---- Shared panel styles ---- */
@@ -316,9 +355,30 @@ body {
   font-style: italic;
 }
 
+/* ---- Type label shown under each variable / field name ---- */
+.var-name {
+  display: block;
+}
+
+.var-type {
+  display: block;
+  font-family: var(--font-ui);
+  font-size: 9.5px;
+  font-style: italic;
+  color: var(--text-muted);
+  opacity: 0.75;
+  white-space: normal;
+  line-height: 1.2;
+}
+
 .var-pointer {
   color: var(--text-accent);
   cursor: default;
+}
+
+.var-pointer--hidden {
+  opacity: 0.5;
+  cursor: help;
 }
 
 .var-scalar {
@@ -389,6 +449,11 @@ body {
   font-size: 11px;
   color: var(--text-accent);
   font-weight: 600;
+}
+
+.heap-block__addr--hidden {
+  opacity: 0.5;
+  cursor: help;
 }
 
 .heap-block__type {

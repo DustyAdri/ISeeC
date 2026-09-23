@@ -2,19 +2,11 @@ import * as cp from "child_process";
 import * as readline from "readline";
 import * as vscode from "vscode";
 import { EventEmitter } from "events";
-import { StepData } from "./types/stepTypes";
-import { isValidStepData } from "./schemas/stepSchema";
+import { StepMessage } from "./types/stepTypes";
+import { isValidStepMessage } from "./schemas/stepSchema";
 
-/** Callback invoked for each validated step received from GDB stdout. */
-export type OnStepCallback = (step: StepData) => void;
+export type OnStepCallback = (step: StepMessage) => void;
 
-/**
- * GdbManager owns the GDB child process and handles all I/O with it.
- *
- * Events:
- *   "error"   emitted when GDB exits with a non-zero code.
- *             Payload: { code: number | null, signal: string | null }
- */
 export class GdbManager extends EventEmitter {
   private _proc: cp.ChildProcess | null = null;
   private _killTimer: NodeJS.Timeout | null = null;
@@ -32,22 +24,25 @@ export class GdbManager extends EventEmitter {
     this._outputChannel = outputChannel;
   }
 
-  /**
-   * Spawn GDB with the tracer script.
-   * Reads stdout line-by-line; each line is parsed as JSON and validated
-   * before being forwarded to the onStep callback.
-   */
   start(): void {
     if (this._proc) {
       throw new Error("GdbManager.start() called while already running");
     }
 
+    const normalizedTracerPath = this.tracerPath.replace(/\\/g, "/");
+
     const args = [
       "-batch",
-      "-ex", `source ${this.tracerPath}`,
-      "-ex", "run",
+      "-ex", `source ${normalizedTracerPath}`,
+      // "run_traced" (defined by the tracer script) redirects the
+      // inferior's stdout to a temp file instead of plain "run" — GDB
+      // doesn't reliably share the debuggee's stdout with our own pipe on
+      // Windows when GDB itself has no real console.
+      "-ex", "run_traced",
       this.binaryPath,
     ];
+
+    this._outputChannel.appendLine(`[c-stack-viz] Spawning GDB with args: ${JSON.stringify(args)}`);
 
     this._proc = cp.spawn("gdb", args, {
       stdio: ["pipe", "pipe", "pipe"],
@@ -57,7 +52,6 @@ export class GdbManager extends EventEmitter {
       this._outputChannel.appendLine(`[gdb stderr] ${chunk.toString().trimEnd()}`);
     });
 
-    // Line-by-line stdout parsing.
     const rl = readline.createInterface({
       input: this._proc.stdout!,
       crlfDelay: Infinity,
@@ -79,7 +73,7 @@ export class GdbManager extends EventEmitter {
         return;
       }
 
-      if (!isValidStepData(parsed)) {
+      if (!isValidStepMessage(parsed)) {
         this._outputChannel.appendLine(
           `[c-stack-viz] Skipping invalid StepData (missing required fields): ${trimmed}`
         );
@@ -109,10 +103,6 @@ export class GdbManager extends EventEmitter {
     });
   }
 
-  /**
-   * Write a control command to GDB stdin.
-   * Valid values: "next" | "step" | "continue" | "quit"
-   */
   sendControl(cmd: "next" | "step" | "continue" | "quit"): void {
     if (!this._proc || !this._proc.stdin || this._proc.stdin.destroyed) {
       this._outputChannel.appendLine(
@@ -130,10 +120,6 @@ export class GdbManager extends EventEmitter {
     });
   }
 
-  /**
-   * Kill the GDB process.
-   * Sends SIGTERM first, then SIGKILL after 2 seconds if still alive.
-   */
   dispose(): void {
     if (!this._proc) {
       return;
@@ -143,24 +129,30 @@ export class GdbManager extends EventEmitter {
     this._proc = null;
 
     try {
+      proc.stdin?.end();
+    } catch {
+      // best-effort
+    }
+
+    try {
       proc.kill("SIGTERM");
     } catch {
-      // Process may already be dead.
+      // best-effort
     }
 
     this._killTimer = setTimeout(() => {
       this._killTimer = null;
       try {
-        if (!proc.killed) {
-          proc.kill("SIGKILL");
-        }
+        proc.kill("SIGKILL");
       } catch {
-        // Best-effort.
+        // best-effort
       }
-    }, 2000);
+      if (proc.pid) {
+        cp.exec(`taskkill /F /T /PID ${proc.pid}`, () => {});
+      }
+    }, 1000);
   }
 
-  /** True if the GDB process is currently running. */
   get isRunning(): boolean {
     return this._proc !== null;
   }

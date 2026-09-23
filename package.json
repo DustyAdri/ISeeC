@@ -27,12 +27,27 @@
         "command": "c-stack-viz.stepBack",
         "title": "Step Back"
       }
+    ],
+    "keybindings": [
+      {
+        "command": "c-stack-viz.stepForward",
+        "key": "alt+right",
+        "mac": "alt+right",
+        "when": "c-stack-viz.active && editorTextFocus"
+      },
+      {
+        "command": "c-stack-viz.stepBack",
+        "key": "alt+left",
+        "mac": "alt+left",
+        "when": "c-stack-viz.active && editorTextFocus"
+      }
     ]
   },
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "build-webview": "cd webview && npm run build"
+    "build-webview": "cd webview && npm run build",
+    "dev:host": "npm run compile && code --extensionDevelopmentPath=. --disable-extensions --user-data-dir=%TEMP%\\c-stack-viz-devhost --new-window"
   },
   "devDependencies": {
     "@types/node": "^26.4.1",

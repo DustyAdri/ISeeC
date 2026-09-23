@@ -38,13 +38,6 @@ const cp = __importStar(require("child_process"));
 const readline = __importStar(require("readline"));
 const events_1 = require("events");
 const stepSchema_1 = require("./schemas/stepSchema");
-/**
- * GdbManager owns the GDB child process and handles all I/O with it.
- *
- * Events:
- *   "error"   emitted when GDB exits with a non-zero code.
- *             Payload: { code: number | null, signal: string | null }
- */
 class GdbManager extends events_1.EventEmitter {
     constructor(binaryPath, tracerPath, onStep, outputChannel) {
         super();
@@ -55,28 +48,28 @@ class GdbManager extends events_1.EventEmitter {
         this._onStep = onStep;
         this._outputChannel = outputChannel;
     }
-    /**
-     * Spawn GDB with the tracer script.
-     * Reads stdout line-by-line; each line is parsed as JSON and validated
-     * before being forwarded to the onStep callback.
-     */
     start() {
         if (this._proc) {
             throw new Error("GdbManager.start() called while already running");
         }
+        const normalizedTracerPath = this.tracerPath.replace(/\\/g, "/");
         const args = [
             "-batch",
-            "-ex", `source ${this.tracerPath}`,
-            "-ex", "run",
+            "-ex", `source ${normalizedTracerPath}`,
+            // "run_traced" (defined by the tracer script) redirects the
+            // inferior's stdout to a temp file instead of plain "run" — GDB
+            // doesn't reliably share the debuggee's stdout with our own pipe on
+            // Windows when GDB itself has no real console.
+            "-ex", "run_traced",
             this.binaryPath,
         ];
+        this._outputChannel.appendLine(`[c-stack-viz] Spawning GDB with args: ${JSON.stringify(args)}`);
         this._proc = cp.spawn("gdb", args, {
             stdio: ["pipe", "pipe", "pipe"],
         });
         this._proc.stderr?.on("data", (chunk) => {
             this._outputChannel.appendLine(`[gdb stderr] ${chunk.toString().trimEnd()}`);
         });
-        // Line-by-line stdout parsing.
         const rl = readline.createInterface({
             input: this._proc.stdout,
             crlfDelay: Infinity,
@@ -94,7 +87,7 @@ class GdbManager extends events_1.EventEmitter {
                 this._outputChannel.appendLine(`[c-stack-viz] Skipping non-JSON line from GDB: ${trimmed}`);
                 return;
             }
-            if (!(0, stepSchema_1.isValidStepData)(parsed)) {
+            if (!(0, stepSchema_1.isValidStepMessage)(parsed)) {
                 this._outputChannel.appendLine(`[c-stack-viz] Skipping invalid StepData (missing required fields): ${trimmed}`);
                 return;
             }
@@ -115,10 +108,6 @@ class GdbManager extends events_1.EventEmitter {
             this.emit("error", { code: null, signal: null });
         });
     }
-    /**
-     * Write a control command to GDB stdin.
-     * Valid values: "next" | "step" | "continue" | "quit"
-     */
     sendControl(cmd) {
         if (!this._proc || !this._proc.stdin || this._proc.stdin.destroyed) {
             this._outputChannel.appendLine(`[c-stack-viz] sendControl("${cmd}") ignored — GDB is not running`);
@@ -130,10 +119,6 @@ class GdbManager extends events_1.EventEmitter {
             }
         });
     }
-    /**
-     * Kill the GDB process.
-     * Sends SIGTERM first, then SIGKILL after 2 seconds if still alive.
-     */
     dispose() {
         if (!this._proc) {
             return;
@@ -141,24 +126,30 @@ class GdbManager extends events_1.EventEmitter {
         const proc = this._proc;
         this._proc = null;
         try {
+            proc.stdin?.end();
+        }
+        catch {
+            // best-effort
+        }
+        try {
             proc.kill("SIGTERM");
         }
         catch {
-            // Process may already be dead.
+            // best-effort
         }
         this._killTimer = setTimeout(() => {
             this._killTimer = null;
             try {
-                if (!proc.killed) {
-                    proc.kill("SIGKILL");
-                }
+                proc.kill("SIGKILL");
             }
             catch {
-                // Best-effort.
+                // best-effort
             }
-        }, 2000);
+            if (proc.pid) {
+                cp.exec(`taskkill /F /T /PID ${proc.pid}`, () => { });
+            }
+        }, 1000);
     }
-    /** True if the GDB process is currently running. */
     get isRunning() {
         return this._proc !== null;
     }

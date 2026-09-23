@@ -50,6 +50,13 @@ let _stepBuffer = null;
 let _webviewProvider = null;
 let _lineDecoration = null;
 let _activeSourcePath = null;
+// True while the whole trace is being run eagerly to completion (see
+// cmdStart) so the total step count is known before anything is shown.
+let _preloading = false;
+// Matches the SRS's own "must support up to 10,000 steps" buffer-size
+// requirement — also doubles as a safety cap so a student's infinite loop
+// can't hang the initial trace forever.
+const MAX_PRELOAD_STEPS = 10000;
 // ---------------------------------------------------------------------------
 // Activation entry point
 // ---------------------------------------------------------------------------
@@ -66,10 +73,6 @@ function deactivate() {
 async function cmdStart(context) {
     // 1. Validate active editor is a .c file.
     const editor = vscode.window.activeTextEditor;
-    _webviewProvider.onResetRequest = () => {
-        teardown();
-        _webviewProvider?.postReset();
-    };
     if (!editor) {
         vscode.window.showErrorMessage("c-stack-viz: No active editor.");
         return;
@@ -99,9 +102,7 @@ async function cmdStart(context) {
     }
     // 3. Set up the webview.
     _webviewProvider = new webviewProvider_1.WebviewProvider();
-    _webviewProvider.show(context);
     _webviewProvider.onDidDisposeCallback = () => {
-        // Panel closed by user — kill GDB.
         teardown();
     };
     _webviewProvider.onStepRequest = (direction) => {
@@ -112,6 +113,26 @@ async function cmdStart(context) {
             cmdStepBack();
         }
     };
+    _webviewProvider.onResetRequest = () => {
+        teardown();
+        _webviewProvider?.postReset();
+    };
+    _webviewProvider.onReady = () => {
+        // The panel just (re)loaded with a blank page — restore what it showed.
+        if (_preloading) {
+            _webviewProvider?.postPreloadProgress(_stepBuffer?.length ?? 0);
+            return;
+        }
+        const current = _stepBuffer?.current();
+        if (current) {
+            _displayStep(current);
+        }
+    };
+    _webviewProvider.show(context);
+    // Enables the Alt+Left/Right step keybindings (see package.json) only
+    // while a session is live, so they don't shadow VS Code's own
+    // navigate back/forward the rest of the time.
+    vscode.commands.executeCommand("setContext", "c-stack-viz.active", true);
     // 4. Set up the step buffer.
     _stepBuffer = new stepBuffer_1.StepBuffer();
     // 5. Create editor line highlight decoration.
@@ -120,25 +141,74 @@ async function cmdStart(context) {
         isWholeLine: true,
         borderRadius: "2px",
     });
-    // 6. Resolve the tracer path (backend/gdb_tracer.py relative to extension).
+    // 6. Resolve the tracer path.
     const tracerPath = path.join(context.extensionPath, "backend", "gdb_tracer.py");
-    // 7. Start GDB.
-    _gdbManager = new gdbManager_1.GdbManager(binaryPath, tracerPath, (step) => {
-        _stepBuffer.push(step);
-        _webviewProvider?.postStep(step);
-        highlightLine(step.current_line);
-        // Tombstone step: GDB has finished (current_line is null).
-        if (step.current_line === null) {
-            _webviewProvider?.postFinished(step);
+    // 7. Start GDB. The whole trace is run eagerly to completion before
+    // anything is shown — see the _preloading block below — so that the
+    // "Step N / total" counter can show the program's real final step count
+    // from the very first frame, instead of a number that just always
+    // matches whatever step is currently on screen.
+    _preloading = true;
+    const manager = new gdbManager_1.GdbManager(binaryPath, tracerPath, (msg) => {
+        // A killed GDB can still flush already-buffered stdout lines after
+        // teardown() (or after a newer session replaced it) — drop those
+        // instead of dereferencing a null/foreign _stepBuffer.
+        if (_gdbManager !== manager || !_stepBuffer) {
+            return;
         }
+        const step = _stepBuffer.push(msg);
+        if (_preloading) {
+            // A crash (SIGSEGV, SIGFPE, ...) ends the trace too — the tracer
+            // only accepts "quit" after emitting this step, so sending it
+            // another "step" would just hang waiting for a response that
+            // never comes.
+            const reachedEnd = step.current_line === null || !!step.crash_signal;
+            const hitCap = _stepBuffer.length >= MAX_PRELOAD_STEPS;
+            if (!reachedEnd && !hitCap) {
+                // Preloading can take a while on a slow/loaded machine (each
+                // step is a real GDB round-trip) and nothing was shown to the
+                // user yet — without this, a slow trace and a genuinely hung
+                // one look identical from the webview's side.
+                _webviewProvider?.postPreloadProgress(_stepBuffer.length);
+                // "step" (not "next") so calls into user-defined functions build
+                // a real call stack instead of being stepped over.
+                _gdbManager?.sendControl("step");
+                return;
+            }
+            _preloading = false;
+            if (hitCap && !reachedEnd) {
+                _outputChannel.appendLine(`[c-stack-viz] Trace truncated at ${MAX_PRELOAD_STEPS} steps — ` +
+                    `the program hadn't finished yet (possible infinite loop).`);
+            }
+            // Reveal step 1 now that the buffer holds the entire trace and the
+            // true total is known.
+            const first = _stepBuffer.forward();
+            if (first) {
+                _displayStep(first);
+            }
+            return;
+        }
+        // Not preloading — every other step is served from the buffer by
+        // cmdStepForward/cmdStepBack, so arrival here would only mean a stray
+        // GDB message; nothing to display.
     }, _outputChannel);
-    _gdbManager.on("error", ({ code }) => {
+    _gdbManager = manager;
+    manager.on("error", ({ code }) => {
+        // Same guard: an old GDB being killed during teardown exits non-zero,
+        // which must not show up as an error in a newer session's panel.
+        if (_gdbManager !== manager) {
+            return;
+        }
         const msg = `GDB exited with code ${code ?? "unknown"}.`;
         _outputChannel.appendLine(`[c-stack-viz] ${msg}`);
         _webviewProvider?.postError(msg);
     });
     try {
         _gdbManager.start();
+        // The tracer's initial "break main" hit fires as soon as GDB starts, so
+        // the arrival callback above takes it from here — kick off the eager
+        // pre-run loop by requesting the first "step".
+        _gdbManager.sendControl("step");
     }
     catch (err) {
         vscode.window.showErrorMessage(`c-stack-viz: Failed to start GDB: ${String(err)}`);
@@ -146,10 +216,6 @@ async function cmdStart(context) {
         teardown();
         return;
     }
-    // Send "next" to advance past the breakpoint GDB inserts at main().
-    // gdb_tracer.py's bootstrap does `break main`, so on the first stop event
-    // the tracer emits a step and then waits for a control command.
-    // We do NOT auto-send here — the user drives with stepForward.
 }
 // ---------------------------------------------------------------------------
 // Command: stop
@@ -161,25 +227,15 @@ function cmdStop() {
 // Command: stepForward
 // ---------------------------------------------------------------------------
 function cmdStepForward() {
-    if (!_stepBuffer || !_gdbManager || !_webviewProvider) {
+    if (!_stepBuffer || !_webviewProvider) {
         return;
     }
-    const wasAtEnd = _stepBuffer.isAtEnd();
+    // The entire trace is already buffered by the time the user can click
+    // Forward (see the eager pre-run in cmdStart), so this is always a pure
+    // in-buffer navigation — no GDB round-trip needed.
     const step = _stepBuffer.forward();
     if (step !== null) {
-        // We advanced within the buffer — serve the cached step.
-        _webviewProvider.postStep(step);
-        highlightLine(step.current_line);
-        // If we were sitting at the end before advancing, we consumed the last
-        // buffered step but GDB hasn't sent the next one yet. Send "next" now
-        // to ask GDB to execute one more line.
-        if (wasAtEnd) {
-            _gdbManager.sendControl("next");
-        }
-    }
-    else {
-        // Buffer was empty; send "next" unconditionally.
-        _gdbManager.sendControl("next");
+        _displayStep(step);
     }
 }
 // ---------------------------------------------------------------------------
@@ -193,9 +249,27 @@ function cmdStepBack() {
     // Never send a control command to GDB for backward steps.
     const step = _stepBuffer.backward();
     if (step !== null) {
-        _webviewProvider.postStep(step);
-        highlightLine(step.current_line);
+        _displayStep(step);
     }
+}
+// ---------------------------------------------------------------------------
+// Shared display helper — the only place that posts a step to the webview,
+// so "finished" is always derived from the step actually being shown
+// (whether reached live from GDB or by navigating buffered history) rather
+// than getting stuck from a stale one-time message.
+// ---------------------------------------------------------------------------
+function _displayStep(step) {
+    // The buffer holds the entire trace by the time anything is ever shown
+    // (see the eager pre-run in cmdStart), so its length IS the program's
+    // real total step count — not just "the highest step seen so far".
+    const totalSteps = _stepBuffer?.length ?? step.step;
+    if (step.current_line === null) {
+        _webviewProvider?.postFinished(step, totalSteps);
+    }
+    else {
+        _webviewProvider?.postStep(step, totalSteps);
+    }
+    highlightLine(step.current_line);
 }
 // ---------------------------------------------------------------------------
 // Editor highlight helper
@@ -238,4 +312,5 @@ function teardown() {
     _stepBuffer?.reset();
     _stepBuffer = null;
     _activeSourcePath = null;
+    vscode.commands.executeCommand("setContext", "c-stack-viz.active", false);
 }

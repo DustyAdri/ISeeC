@@ -1,11 +1,11 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.isValidStepData = isValidStepData;
+exports.isValidStepMessage = isValidStepMessage;
 /**
- * Returns true if the parsed object satisfies the StepData contract.
+ * Returns true if the parsed object satisfies the StepMessage contract.
  * Rejects if any required top-level field is absent or wrong type.
  */
-function isValidStepData(obj) {
+function isValidStepMessage(obj) {
     if (typeof obj !== "object" || obj === null) {
         return false;
     }
@@ -23,7 +23,7 @@ function isValidStepData(obj) {
     if (!Array.isArray(o["stack_frames"])) {
         return false;
     }
-    if (!Array.isArray(o["heap_blocks"])) {
+    if (!Array.isArray(o["heap_changes"])) {
         return false;
     }
     return true;

@@ -13,10 +13,33 @@ class StepBuffer {
     constructor() {
         this._steps = [];
         this._cursor = -1;
+        // Every heap block seen so far, keyed by address. Map keeps a key's
+        // original insertion position when it's overwritten — the same rule as
+        // the tracer's own dict — so the rebuilt list matches the tracer's order.
+        this._heap = new Map();
     }
-    /** Append a new step to the buffer. Does NOT advance the cursor. */
-    push(step) {
+    /**
+     * Rebuild the full step from the tracer's delta (see StepMessage), append
+     * it, and return it. Does NOT advance the cursor.
+     *
+     * Blocks that didn't change keep being the very same object from step to
+     * step, so each buffered step only really costs what changed rather than
+     * a full copy of the heap. Buffered steps are never mutated, so sharing
+     * objects between them is safe.
+     */
+    push(msg) {
+        for (const block of msg.heap_changes) {
+            this._heap.set(block.address, block);
+        }
+        const prev = this._steps[this._steps.length - 1];
+        const { heap_changes: _changes, ...rest } = msg;
+        const step = {
+            ...rest,
+            heap_blocks: Array.from(this._heap.values()),
+            program_output: "program_output" in msg ? msg.program_output : prev?.program_output,
+        };
         this._steps.push(step);
+        return step;
     }
     /**
      * Return the step at the current cursor position.
@@ -59,6 +82,7 @@ class StepBuffer {
     reset() {
         this._steps = [];
         this._cursor = -1;
+        this._heap.clear();
     }
     /** Number of steps currently in the buffer. */
     get length() {

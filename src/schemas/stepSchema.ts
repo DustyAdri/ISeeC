@@ -1,10 +1,10 @@
-import { StepData } from "../types/stepTypes";
+import { StepMessage } from "../types/stepTypes";
 
 /**
- * Returns true if the parsed object satisfies the StepData contract.
+ * Returns true if the parsed object satisfies the StepMessage contract.
  * Rejects if any required top-level field is absent or wrong type.
  */
-export function isValidStepData(obj: unknown): obj is StepData {
+export function isValidStepMessage(obj: unknown): obj is StepMessage {
   if (typeof obj !== "object" || obj === null) {
     return false;
   }
@@ -24,7 +24,7 @@ export function isValidStepData(obj: unknown): obj is StepData {
   if (!Array.isArray(o["stack_frames"])) {
     return false;
   }
-  if (!Array.isArray(o["heap_blocks"])) {
+  if (!Array.isArray(o["heap_changes"])) {
     return false;
   }
 
