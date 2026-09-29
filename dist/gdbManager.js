@@ -39,10 +39,11 @@ const readline = __importStar(require("readline"));
 const events_1 = require("events");
 const stepSchema_1 = require("./schemas/stepSchema");
 class GdbManager extends events_1.EventEmitter {
-    constructor(binaryPath, tracerPath, onStep, outputChannel) {
+    constructor(binaryPath, tracerPath, onStep, outputChannel, stdinPath = null) {
         super();
         this.binaryPath = binaryPath;
         this.tracerPath = tracerPath;
+        this.stdinPath = stdinPath;
         this._proc = null;
         this._killTimer = null;
         this._onStep = onStep;
@@ -60,7 +61,10 @@ class GdbManager extends events_1.EventEmitter {
             // inferior's stdout to a temp file instead of plain "run" — GDB
             // doesn't reliably share the debuggee's stdout with our own pipe on
             // Windows when GDB itself has no real console.
-            "-ex", "run_traced",
+            "-ex",
+            this.stdinPath
+                ? `run_traced ${this.stdinPath.replace(/\\/g, "/")}`
+                : "run_traced",
             this.binaryPath,
         ];
         this._outputChannel.appendLine(`[c-stack-viz] Spawning GDB with args: ${JSON.stringify(args)}`);

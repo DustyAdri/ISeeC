@@ -17,7 +17,8 @@ export class GdbManager extends EventEmitter {
     private readonly binaryPath: string,
     private readonly tracerPath: string,
     onStep: OnStepCallback,
-    outputChannel: vscode.OutputChannel
+    outputChannel: vscode.OutputChannel,
+    private readonly stdinPath: string | null = null
   ) {
     super();
     this._onStep = onStep;
@@ -38,7 +39,10 @@ export class GdbManager extends EventEmitter {
       // inferior's stdout to a temp file instead of plain "run" — GDB
       // doesn't reliably share the debuggee's stdout with our own pipe on
       // Windows when GDB itself has no real console.
-      "-ex", "run_traced",
+      "-ex",
+      this.stdinPath
+        ? `run_traced ${this.stdinPath.replace(/\\/g, "/")}`
+        : "run_traced",
       this.binaryPath,
     ];
 

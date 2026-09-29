@@ -37,6 +37,8 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
+const fs = __importStar(require("fs"));
+const os = __importStar(require("os"));
 const compiler_1 = require("./compiler");
 const gdbManager_1 = require("./gdbManager");
 const stepBuffer_1 = require("./stepBuffer");
@@ -99,6 +101,12 @@ async function cmdStart(context) {
             vscode.window.showErrorMessage(`c-stack-viz: Unexpected error during compilation: ${String(err)}`);
         }
         return;
+    }
+    // 2b. The traced program can't read the terminal (its stdin would be the
+    // pipe carrying step commands), so collect any input it needs up front.
+    const stdinPath = await promptForProgramInput(sourcePath);
+    if (stdinPath === undefined) {
+        return; // user cancelled
     }
     // 3. Set up the webview.
     _webviewProvider = new webviewProvider_1.WebviewProvider();
@@ -191,7 +199,7 @@ async function cmdStart(context) {
         // Not preloading — every other step is served from the buffer by
         // cmdStepForward/cmdStepBack, so arrival here would only mean a stray
         // GDB message; nothing to display.
-    }, _outputChannel);
+    }, _outputChannel, stdinPath);
     _gdbManager = manager;
     manager.on("error", ({ code }) => {
         // Same guard: an old GDB being killed during teardown exits non-zero,
@@ -269,23 +277,70 @@ function _displayStep(step) {
     else {
         _webviewProvider?.postStep(step, totalSteps);
     }
-    highlightLine(step.current_line);
+    highlightLine(step.current_line, step.current_file ?? null);
+}
+// ---------------------------------------------------------------------------
+// Program input (stdin)
+// ---------------------------------------------------------------------------
+const INPUT_CALL_RE = /\b(scanf|fscanf|sscanf|gets|fgets|getchar|getc|fgetc|getline|read)\s*\(/;
+/**
+ * Writes the traced program's stdin to a temp file and returns its path.
+ * If any source file reads input, the user is asked for the values
+ * (whitespace/newline separated, e.g. "1 2 0"). Returns undefined if the
+ * prompt was cancelled.
+ */
+async function promptForProgramInput(sourcePath) {
+    const needsInput = (0, compiler_1.resolveSources)(sourcePath).some((f) => {
+        try {
+            return INPUT_CALL_RE.test(fs.readFileSync(f, "utf8"));
+        }
+        catch {
+            return false;
+        }
+    });
+    let text = "";
+    if (needsInput) {
+        const answer = await vscode.window.showInputBox({
+            title: "C Visualizer: program input",
+            prompt: "This program reads input. Enter every value it will ask for, in order, separated by spaces (e.g. 1 2 0).",
+            placeHolder: "1 2 0",
+            ignoreFocusOut: true,
+        });
+        if (answer === undefined) {
+            return undefined;
+        }
+        text = answer.trim().split(/\s+/).join("\n") + "\n";
+    }
+    const file = path.join(os.tmpdir(), `c_stack_viz_stdin_${process.pid}.txt`);
+    fs.writeFileSync(file, text);
+    return file;
 }
 // ---------------------------------------------------------------------------
 // Editor highlight helper
 // ---------------------------------------------------------------------------
-function highlightLine(line) {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor || !_lineDecoration || line === null) {
+let _decoratedEditor = null;
+function _samePath(a, b) {
+    return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+}
+async function highlightLine(line, file) {
+    if (!_lineDecoration || line === null) {
         return;
     }
-    // Only highlight if the active editor shows the file we're tracing.
-    if (_activeSourcePath &&
-        editor.document.uri.fsPath !== _activeSourcePath) {
+    // Multi-file programs: highlight in whichever file the step is in, but
+    // only if it's already open in a visible editor — never open files or
+    // switch tabs during stepping. Older tracers send no file, so fall back
+    // to the file being traced.
+    const target = file ?? _activeSourcePath;
+    const editor = vscode.window.visibleTextEditors.find((e) => target && _samePath(e.document.uri.fsPath, target));
+    if (!editor || !_lineDecoration) {
         return;
     }
+    if (_decoratedEditor && _decoratedEditor !== editor) {
+        _decoratedEditor.setDecorations(_lineDecoration, []);
+    }
+    _decoratedEditor = editor;
     const zeroIndexed = line - 1; // GDB lines are 1-indexed
-    if (zeroIndexed < 0) {
+    if (zeroIndexed < 0 || zeroIndexed >= editor.document.lineCount) {
         return;
     }
     const range = new vscode.Range(zeroIndexed, 0, zeroIndexed, editor.document.lineAt(zeroIndexed).text.length);
@@ -309,6 +364,7 @@ function teardown() {
     _webviewProvider = null;
     _lineDecoration?.dispose();
     _lineDecoration = null;
+    _decoratedEditor = null;
     _stepBuffer?.reset();
     _stepBuffer = null;
     _activeSourcePath = null;
