@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as cp from "child_process";
 import * as path from "path";
+import * as fs from "fs";
 
 /** Typed error thrown when gcc exits with a non-zero code. */
 export class CompilationError extends Error {
@@ -13,19 +14,57 @@ export class CompilationError extends Error {
   }
 }
 
+const MAIN_RE = /\bmain\s*\(/;
+
+function definesMain(file: string): boolean {
+  try {
+    return MAIN_RE.test(fs.readFileSync(file, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Compile a C source file with `gcc -g`.
+ * Work out which .c files make up the program. The active file is always
+ * included; sibling .c files in the same folder are added when they don't
+ * define their own main() (so unrelated programs in one folder aren't mixed
+ * in). If the active file is a helper without main(), the one sibling that
+ * defines main() is used as the entry point.
+ */
+export function resolveSources(sourcePath: string): string[] {
+  const dir = path.dirname(sourcePath);
+  const siblings = fs
+    .readdirSync(dir)
+    .filter((f) => f.toLowerCase().endsWith(".c"))
+    .map((f) => path.join(dir, f))
+    .filter((f) => path.resolve(f).toLowerCase() !== path.resolve(sourcePath).toLowerCase());
+
+  const helpers = siblings.filter((f) => !definesMain(f));
+  if (definesMain(sourcePath)) {
+    return [sourcePath, ...helpers];
+  }
+  const mains = siblings.filter(definesMain);
+  return mains.length === 1
+    ? [mains[0], sourcePath, ...helpers.filter((f) => f !== sourcePath)]
+    : [sourcePath, ...helpers];
+}
+
+/**
+ * Compile a program with `gcc -g`, linking the active file together with any
+ * sibling .c files (see resolveSources).
  *
- * @param sourcePath  Absolute path to the .c source file.
+ * @param sourcePath  Absolute path to the active .c source file.
  * @returns           Absolute path to the compiled binary (same directory as source).
  * @throws            {CompilationError} if gcc exits with a non-zero code.
  */
 export async function compileFile(sourcePath: string): Promise<string> {
   const dir = path.dirname(sourcePath);
-  const base = path.basename(sourcePath, path.extname(sourcePath));
+  const sources = resolveSources(sourcePath);
+  const entry = sources[0];
+  const base = path.basename(entry, path.extname(entry));
   const binaryPath = path.join(dir, base);
 
-  const args = ["-g", "-o", binaryPath, sourcePath];
+  const args = ["-g", "-o", binaryPath, ...sources];
 
   return new Promise<string>((resolve, reject) => {
     const proc = cp.spawn("gcc", args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -45,8 +84,9 @@ export async function compileFile(sourcePath: string): Promise<string> {
       // gcc error lines look like:
       //   <file>:<line>:<col>: error: <message>
       //   <file>:<line>:<col>: warning: <message>
-      const diagnostics = parseGccStderr(stderr, sourcePath);
-      reportDiagnostics(sourcePath, diagnostics);
+      const byFile = parseGccStderr(stderr, sourcePath);
+      reportDiagnostics(byFile);
+      const diagnostics = [...byFile.values()].flat();
 
       reject(
         new CompilationError(
@@ -77,8 +117,8 @@ const _diagnosticCollection =
 function parseGccStderr(
   stderr: string,
   sourcePath: string
-): vscode.Diagnostic[] {
-  const diagnostics: vscode.Diagnostic[] = [];
+): Map<string, vscode.Diagnostic[]> {
+  const byFile = new Map<string, vscode.Diagnostic[]>();
 
   // Match lines of the form:
   //   /path/to/file.c:10:5: error: some message
@@ -90,10 +130,12 @@ function parseGccStderr(
   while ((match = lineRe.exec(stderr)) !== null) {
     const [, file, lineStr, colStr, severity, message] = match;
 
-    // Only attach diagnostics for the file we compiled.
-    if (!file.endsWith(path.basename(sourcePath)) && file !== sourcePath) {
-      continue;
-    }
+    // Diagnostics can come from any of the linked files. Paths in gcc's
+    // output are relative to its cwd (the extension host's), so resolve
+    // against the source folder when not already absolute.
+    const abs = path.isAbsolute(file)
+      ? file
+      : path.join(path.dirname(sourcePath), file);
 
     const line = Math.max(0, parseInt(lineStr, 10) - 1); // convert to 0-indexed
     const col = Math.max(0, parseInt(colStr, 10) - 1);
@@ -106,22 +148,21 @@ function parseGccStderr(
         ? vscode.DiagnosticSeverity.Warning
         : vscode.DiagnosticSeverity.Information;
 
-    diagnostics.push(new vscode.Diagnostic(range, message, sev));
+    const list = byFile.get(abs) ?? [];
+    list.push(new vscode.Diagnostic(range, message, sev));
+    byFile.set(abs, list);
   }
 
-  return diagnostics;
+  return byFile;
 }
 
-function reportDiagnostics(
-  sourcePath: string,
-  diagnostics: vscode.Diagnostic[]
-): void {
-  const uri = vscode.Uri.file(sourcePath);
-  _diagnosticCollection.set(uri, diagnostics);
+function reportDiagnostics(byFile: Map<string, vscode.Diagnostic[]>): void {
+  for (const [file, diagnostics] of byFile) {
+    _diagnosticCollection.set(vscode.Uri.file(file), diagnostics);
+  }
 }
 
 /** Clear all diagnostics produced by this extension. */
-export function clearDiagnostics(sourcePath: string): void {
-  const uri = vscode.Uri.file(sourcePath);
-  _diagnosticCollection.delete(uri);
+export function clearDiagnostics(_sourcePath: string): void {
+  _diagnosticCollection.clear();
 }

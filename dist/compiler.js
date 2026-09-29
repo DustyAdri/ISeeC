@@ -34,11 +34,13 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.CompilationError = void 0;
+exports.resolveSources = resolveSources;
 exports.compileFile = compileFile;
 exports.clearDiagnostics = clearDiagnostics;
 const vscode = __importStar(require("vscode"));
 const cp = __importStar(require("child_process"));
 const path = __importStar(require("path"));
+const fs = __importStar(require("fs"));
 /** Typed error thrown when gcc exits with a non-zero code. */
 class CompilationError extends Error {
     constructor(message, diagnostics) {
@@ -48,18 +50,53 @@ class CompilationError extends Error {
     }
 }
 exports.CompilationError = CompilationError;
+const MAIN_RE = /\bmain\s*\(/;
+function definesMain(file) {
+    try {
+        return MAIN_RE.test(fs.readFileSync(file, "utf8"));
+    }
+    catch {
+        return false;
+    }
+}
 /**
- * Compile a C source file with `gcc -g`.
+ * Work out which .c files make up the program. The active file is always
+ * included; sibling .c files in the same folder are added when they don't
+ * define their own main() (so unrelated programs in one folder aren't mixed
+ * in). If the active file is a helper without main(), the one sibling that
+ * defines main() is used as the entry point.
+ */
+function resolveSources(sourcePath) {
+    const dir = path.dirname(sourcePath);
+    const siblings = fs
+        .readdirSync(dir)
+        .filter((f) => f.toLowerCase().endsWith(".c"))
+        .map((f) => path.join(dir, f))
+        .filter((f) => path.resolve(f).toLowerCase() !== path.resolve(sourcePath).toLowerCase());
+    const helpers = siblings.filter((f) => !definesMain(f));
+    if (definesMain(sourcePath)) {
+        return [sourcePath, ...helpers];
+    }
+    const mains = siblings.filter(definesMain);
+    return mains.length === 1
+        ? [mains[0], sourcePath, ...helpers.filter((f) => f !== sourcePath)]
+        : [sourcePath, ...helpers];
+}
+/**
+ * Compile a program with `gcc -g`, linking the active file together with any
+ * sibling .c files (see resolveSources).
  *
- * @param sourcePath  Absolute path to the .c source file.
+ * @param sourcePath  Absolute path to the active .c source file.
  * @returns           Absolute path to the compiled binary (same directory as source).
  * @throws            {CompilationError} if gcc exits with a non-zero code.
  */
 async function compileFile(sourcePath) {
     const dir = path.dirname(sourcePath);
-    const base = path.basename(sourcePath, path.extname(sourcePath));
+    const sources = resolveSources(sourcePath);
+    const entry = sources[0];
+    const base = path.basename(entry, path.extname(entry));
     const binaryPath = path.join(dir, base);
-    const args = ["-g", "-o", binaryPath, sourcePath];
+    const args = ["-g", "-o", binaryPath, ...sources];
     return new Promise((resolve, reject) => {
         const proc = cp.spawn("gcc", args, { stdio: ["ignore", "pipe", "pipe"] });
         let stderr = "";
@@ -75,8 +112,9 @@ async function compileFile(sourcePath) {
             // gcc error lines look like:
             //   <file>:<line>:<col>: error: <message>
             //   <file>:<line>:<col>: warning: <message>
-            const diagnostics = parseGccStderr(stderr, sourcePath);
-            reportDiagnostics(sourcePath, diagnostics);
+            const byFile = parseGccStderr(stderr, sourcePath);
+            reportDiagnostics(byFile);
+            const diagnostics = [...byFile.values()].flat();
             reject(new CompilationError(`gcc exited with code ${code}:\n${stderr}`, diagnostics));
         });
         proc.on("error", (err) => {
@@ -89,7 +127,7 @@ async function compileFile(sourcePath) {
 // ---------------------------------------------------------------------------
 const _diagnosticCollection = vscode.languages.createDiagnosticCollection("c-stack-viz");
 function parseGccStderr(stderr, sourcePath) {
-    const diagnostics = [];
+    const byFile = new Map();
     // Match lines of the form:
     //   /path/to/file.c:10:5: error: some message
     //   /path/to/file.c:10:5: warning: some message
@@ -97,10 +135,12 @@ function parseGccStderr(stderr, sourcePath) {
     let match;
     while ((match = lineRe.exec(stderr)) !== null) {
         const [, file, lineStr, colStr, severity, message] = match;
-        // Only attach diagnostics for the file we compiled.
-        if (!file.endsWith(path.basename(sourcePath)) && file !== sourcePath) {
-            continue;
-        }
+        // Diagnostics can come from any of the linked files. Paths in gcc's
+        // output are relative to its cwd (the extension host's), so resolve
+        // against the source folder when not already absolute.
+        const abs = path.isAbsolute(file)
+            ? file
+            : path.join(path.dirname(sourcePath), file);
         const line = Math.max(0, parseInt(lineStr, 10) - 1); // convert to 0-indexed
         const col = Math.max(0, parseInt(colStr, 10) - 1);
         const range = new vscode.Range(line, col, line, col + 1);
@@ -109,16 +149,18 @@ function parseGccStderr(stderr, sourcePath) {
             : severity === "warning"
                 ? vscode.DiagnosticSeverity.Warning
                 : vscode.DiagnosticSeverity.Information;
-        diagnostics.push(new vscode.Diagnostic(range, message, sev));
+        const list = byFile.get(abs) ?? [];
+        list.push(new vscode.Diagnostic(range, message, sev));
+        byFile.set(abs, list);
     }
-    return diagnostics;
+    return byFile;
 }
-function reportDiagnostics(sourcePath, diagnostics) {
-    const uri = vscode.Uri.file(sourcePath);
-    _diagnosticCollection.set(uri, diagnostics);
+function reportDiagnostics(byFile) {
+    for (const [file, diagnostics] of byFile) {
+        _diagnosticCollection.set(vscode.Uri.file(file), diagnostics);
+    }
 }
 /** Clear all diagnostics produced by this extension. */
-function clearDiagnostics(sourcePath) {
-    const uri = vscode.Uri.file(sourcePath);
-    _diagnosticCollection.delete(uri);
+function clearDiagnostics(_sourcePath) {
+    _diagnosticCollection.clear();
 }
