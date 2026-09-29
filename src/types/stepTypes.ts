@@ -26,6 +26,9 @@ export interface HeapBlock {
 export interface StepData {
   step: number;
   current_line: number | null;
+  // Absolute path of the source file current_line belongs to (multi-file
+  // programs). Optional for backward compatibility with older tracers.
+  current_file?: string | null;
   next_line: number | null;
   stack_frames: StackFrame[];
   heap_blocks: HeapBlock[];
