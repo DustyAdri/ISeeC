@@ -209,6 +209,9 @@ def _encode_scalar(val):
 # Variable encoding  (Prompt 1 — unchanged interface)
 # ---------------------------------------------------------------------------
 
+_MAX_VALUE_CHARS = 80
+
+
 def _encode_var(name, sym, frame, frame_key, is_fresh_frame):
     """
     Read one local variable / argument from *frame* and return its dict.
@@ -273,6 +276,12 @@ def _encode_var(name, sym, frame, frame_key, is_fresh_frame):
         result["value"] = "?"
         result["target_address"] = None
     else:
+        # Structs/arrays fall back to gdb's full text dump, which for nested
+        # aggregates (e.g. a struct of arrays of structs of char buffers) is
+        # thousands of characters. The full string is still what the
+        # garbage/change detection above compares; only the display is cut.
+        if len(value_str) > _MAX_VALUE_CHARS:
+            value_str = value_str[:_MAX_VALUE_CHARS] + " ..."
         result["value"] = value_str
         result["target_address"] = target_addr
     return result
@@ -500,6 +509,14 @@ def _current_line():
         return None
 
 
+def _current_file():
+    try:
+        sal = gdb.selected_frame().find_sal()
+        return sal.symtab.fullname() if sal and sal.symtab else None
+    except Exception:
+        return None
+
+
 def _has_real_source(frame):
     """
     True if *frame* corresponds to a source file that actually exists on
@@ -561,7 +578,11 @@ class _RunTracedCommand(gdb.Command):
         fd, path = tempfile.mkstemp(prefix="c_stack_viz_stdout_", suffix=".log")
         os.close(fd)
         _stdout_capture_path[0] = path
-        gdb.execute("run > %s 2>&1" % path)
+        # The inferior must not inherit gdb's own stdin: that is the pipe the
+        # extension sends step/next commands on, so scanf() would swallow
+        # them. *arg* is a file holding the program's input instead.
+        stdin_path = arg.strip() if arg else os.devnull
+        gdb.execute("run > %s 2>&1 < %s" % (path, stdin_path))
 
 
 _RunTracedCommand()
@@ -675,6 +696,7 @@ def _write_step(current_line, next_ln, stack_frames, crash_signal, output):
     obj = {
         "step": _step_count[0],
         "current_line": current_line,
+        "current_file": _current_file() if current_line is not None else None,
         "next_line": next_ln,
         "stack_frames": stack_frames,
         "heap_changes": changes,
